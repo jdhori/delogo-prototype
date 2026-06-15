@@ -1,0 +1,21 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local-only test assets (not part of the prototype itself)
+_sample.mp4
+*.mkv
+*.mov
+
+# Self-hosted FFmpeg-WASM core (~32 MB). Recreated by setup.sh from unpkg.
+ffmpeg/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Build / scratch
+node_modules/
+dist/
+.cache/
