@@ -35,26 +35,53 @@
 (function (global) {
   "use strict";
 
+  // Seek to t AND wait until a new frame is actually decoded and ready to
+  // draw. The 'seeked' event alone is unreliable for offscreen / muted /
+  // never-played videos because the browser may fire it before the
+  // GPU-decoded frame is available — drawImage then captures the OLD
+  // frame and every sampled "frame" looks identical to frame 0.
+  //
+  // requestVideoFrameCallback (Chrome 83+, Edge, Opera) is the modern
+  // signal for "new frame is here". Fallback: 'seeked' + a small RAF
+  // chain to let the compositor catch up.
   function seekTo(video, t) {
     return new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (done) return; done = true; resolve(); };
+
+      const useRVFC = typeof video.requestVideoFrameCallback === "function";
       const onSeeked = () => {
         video.removeEventListener("seeked", onSeeked);
-        resolve();
+        if (useRVFC) {
+          video.requestVideoFrameCallback(() => finish());
+        } else {
+          // Two RAFs ≈ ~32ms; gives the compositor time to receive the
+          // decoded frame before we read pixels off the canvas.
+          requestAnimationFrame(() => requestAnimationFrame(finish));
+        }
       };
       video.addEventListener("seeked", onSeeked);
+      // Safety timeout — if neither seeked nor RVFC fires (very rare on
+      // malformed sources), don't hang the whole scan.
+      setTimeout(finish, 1500);
       video.currentTime = t;
     });
   }
 
-  // Per-row edge density in the bottom half. Returns the strongest contiguous
-  // band (y0Pct, y1Pct, density) or null if none looks caption-shaped.
-  function findCaptionBand(frame, w, h) {
+  // Find caption bands in the bottom half of a frame, with per-band width
+  // measurement. Returns an array of bands — empty if no caption present.
+  // Each band represents one text line and includes its tight horizontal
+  // extent so multi-line captions with different line widths get
+  // individually-sized rectangles instead of one bbox over both lines.
+  function findCaptionBands(frame, w, h) {
     const data = frame.data;
     const bottomStart = Math.floor(h * 0.45);
-    const edgeThreshold = 38; // luma diff between adjacent pixels
-    const rowHotnessThreshold = 0.06; // fraction of edges per row to qualify
+    const edgeThreshold = 38;
+    const rowHotnessThreshold = 0.06;
+    const colHotnessThreshold = 0.10; // for measuring band's horizontal extent
 
-    const density = new Array(h - bottomStart);
+    // 1) Per-row edge density in the bottom half.
+    const rowDensity = new Array(h - bottomStart);
     for (let y = bottomStart; y < h; y++) {
       let edges = 0;
       for (let x = 1; x < w; x++) {
@@ -64,36 +91,73 @@
         const lb = 0.299 * data[j] + 0.587 * data[j + 1] + 0.114 * data[j + 2];
         if (Math.abs(la - lb) > edgeThreshold) edges++;
       }
-      density[y - bottomStart] = edges / w;
+      rowDensity[y - bottomStart] = edges / w;
     }
 
-    // Group contiguous "hot" rows (≥ 3 rows wide, allow 1-row gaps).
-    const bands = [];
-    let start = -1;
-    let gap = 0;
-    for (let k = 0; k <= density.length; k++) {
-      const hot = k < density.length && density[k] > rowHotnessThreshold;
-      if (hot) {
-        if (start < 0) start = k;
-        gap = 0;
-      } else if (start >= 0) {
+    // 2) Group contiguous "hot" rows into vertical bands (allow 1-row gap).
+    const verticalBands = [];
+    let start = -1, gap = 0;
+    for (let k = 0; k <= rowDensity.length; k++) {
+      const hot = k < rowDensity.length && rowDensity[k] > rowHotnessThreshold;
+      if (hot) { if (start < 0) start = k; gap = 0; }
+      else if (start >= 0) {
         gap++;
         if (gap > 1) {
           const len = k - gap - start;
-          if (len >= 3) bands.push({ y0: bottomStart + start, y1: bottomStart + k - gap - 1, len });
-          start = -1;
-          gap = 0;
+          if (len >= 3) verticalBands.push({ y0: bottomStart + start, y1: bottomStart + k - gap - 1, len });
+          start = -1; gap = 0;
         }
       }
     }
+    if (verticalBands.length === 0) return [];
+
+    // 3) For each vertical band, scan columns to find its true horizontal
+    // extent. Text lines start where columns first show edge activity and
+    // end at the last column with activity. This catches "short bottom
+    // line" cases where a 2-line caption has uneven sentence lengths.
+    const bands = [];
+    for (const vb of verticalBands) {
+      const bandHeight = vb.y1 - vb.y0 + 1;
+      const colEdges = new Array(w).fill(0);
+      for (let y = vb.y0; y <= vb.y1; y++) {
+        for (let x = 1; x < w; x++) {
+          const i = (y * w + x) * 4;
+          const j = (y * w + x - 1) * 4;
+          const la = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          const lb = 0.299 * data[j] + 0.587 * data[j + 1] + 0.114 * data[j + 2];
+          if (Math.abs(la - lb) > edgeThreshold) colEdges[x]++;
+        }
+      }
+      // Normalize to fraction of band rows that have an edge in this column.
+      const norm = colEdges.map((c) => c / bandHeight);
+
+      // Find leftmost & rightmost column with sufficient density,
+      // tolerating short gaps (single-column quiet spots between letters).
+      let left = -1, right = -1;
+      for (let x = 0; x < w; x++) if (norm[x] > colHotnessThreshold) { left = x; break; }
+      for (let x = w - 1; x >= 0; x--) if (norm[x] > colHotnessThreshold) { right = x; break; }
+      if (left < 0 || right < 0 || right - left < w * 0.05) continue; // too narrow
+
+      bands.push({
+        y0Pct: (vb.y0 / h) * 100,
+        y1Pct: (vb.y1 / h) * 100,
+        x0Pct: (left / w) * 100,
+        x1Pct: (right / w) * 100,
+        heightPct: (bandHeight / h) * 100,
+        widthPct: ((right - left) / w) * 100,
+      });
+    }
+    return bands;
+  }
+
+  // Backwards-compat: keep findCaptionBand returning the strongest band
+  // as the older signature (some test paths and the legacy run-grouper
+  // still consume it). Built on top of findCaptionBands.
+  function findCaptionBand(frame, w, h) {
+    const bands = findCaptionBands(frame, w, h);
     if (bands.length === 0) return null;
-    bands.sort((a, b) => b.len - a.len);
-    const b = bands[0];
-    return {
-      y0Pct: (b.y0 / h) * 100,
-      y1Pct: (b.y1 / h) * 100,
-      heightPct: ((b.y1 - b.y0) / h) * 100,
-    };
+    bands.sort((a, b) => b.heightPct * b.widthPct - a.heightPct * a.widthPct);
+    return bands[0];
   }
 
   /* Static watermark detector — finds persistent low-contrast structures
@@ -214,36 +278,59 @@
     return best;
   }
 
-  function groupCaptionRanges(bandsBySample, samples, totalDurationSec) {
+  // Group consecutive samples that show captions into time ranges.
+  // For multi-line captions we emit ONE region per text line so each line
+  // gets its own measured width — the "short bottom line" case that's
+  // common with multi-sentence captions. bandsListBySample is the new
+  // shape: array of arrays of bands (each band = one text line).
+  function groupCaptionRanges(bandsListBySample, samples, totalDurationSec) {
     const regions = [];
     let runStart = -1;
-    const pad = 0.3; // seconds of padding on each side of the run
+    const pad = 0.3;
 
-    for (let i = 0; i <= bandsBySample.length; i++) {
-      const present = i < bandsBySample.length && !!bandsBySample[i];
+    const presentAt = (i) => Array.isArray(bandsListBySample[i]) && bandsListBySample[i].length > 0;
+
+    for (let i = 0; i <= bandsListBySample.length; i++) {
+      const present = i < bandsListBySample.length && presentAt(i);
       if (present && runStart < 0) runStart = i;
       else if (!present && runStart >= 0) {
         const runEnd = i - 1;
-        let y0 = 0, y1 = 0, n = 0;
-        for (let k = runStart; k <= runEnd; k++) {
-          if (!bandsBySample[k]) continue;
-          y0 += bandsBySample[k].y0Pct;
-          y1 += bandsBySample[k].y1Pct;
-          n++;
-        }
-        if (n > 0) {
-          y0 /= n; y1 /= n;
-          const heightPct = y1 - y0;
-          const lineCount = heightPct > 8 ? 2 : 1;
+        // Across the run, find the MAX line count seen in any sample and
+        // average the geometry of each line slot. If frames show different
+        // line counts (1 line vs 2 lines mid-run), we still output one
+        // region per line up to the max — the per-line time bounds match
+        // the whole run (sentence-change detection handles the time split).
+        let maxLines = 0;
+        for (let k = runStart; k <= runEnd; k++) maxLines = Math.max(maxLines, bandsListBySample[k]?.length || 0);
+        if (maxLines === 0) { runStart = -1; continue; }
+
+        // Build per-line aggregates. Bands within a sample are top-to-bottom
+        // (sorted by y0 below) so line index 0 is always the topmost line.
+        for (let lineIdx = 0; lineIdx < maxLines; lineIdx++) {
+          let y0 = 0, y1 = 0, x0 = 0, x1 = 0, n = 0;
+          for (let k = runStart; k <= runEnd; k++) {
+            const sorted = (bandsListBySample[k] || []).slice().sort((a, b) => a.y0Pct - b.y0Pct);
+            const band = sorted[lineIdx];
+            if (!band) continue;
+            y0 += band.y0Pct; y1 += band.y1Pct;
+            x0 += band.x0Pct; x1 += band.x1Pct;
+            n++;
+          }
+          if (n === 0) continue;
+          y0 /= n; y1 /= n; x0 /= n; x1 /= n;
+          const heightPct = Math.max(y1 - y0 + 1, 4);
+          const widthPct  = Math.max(x1 - x0 + 1, 6);
           const tStart = Math.max(0, samples[runStart].t - pad);
-          const tEnd = Math.min(totalDurationSec, samples[runEnd].t + pad);
+          const tEnd   = Math.min(totalDurationSec, samples[runEnd].t + pad);
           regions.push({
             kind: "caption",
-            lineCount,
-            xPct: 5,
+            lineCount: maxLines,
+            lineIndex: lineIdx,
+            // Pad slightly on each side so feathered blur covers the edges.
+            xPct: Math.max(0, x0 - 1.5),
             yPct: Math.max(0, y0 - 1),
-            wPct: 90,
-            hPct: Math.max(heightPct + 2, 6),
+            wPct: Math.min(100, widthPct + 3),
+            hPct: heightPct + 2,
             startSeconds: tStart,
             endSeconds: tEnd,
             confidence: Math.min(0.95, 0.55 + 0.08 * n),
@@ -255,12 +342,55 @@
     return regions;
   }
 
+  // Build a coarse signature of a caption band's pixel content. Splits the
+  // band into N horizontal cells and computes per-cell mean luma. Used to
+  // detect when the caption text CHANGES (different sentence) vs stays
+  // the same. Returns a Float32Array of length cellCount.
+  function captionBandSignature(frame, w, h, band, cellCount) {
+    cellCount = cellCount || 16;
+    const sig = new Float32Array(cellCount);
+    const y0 = Math.max(0, Math.floor((band.y0Pct / 100) * h));
+    const y1 = Math.min(h - 1, Math.ceil((band.y1Pct / 100) * h));
+    const x0 = Math.max(0, Math.floor((band.x0Pct / 100) * w));
+    const x1 = Math.min(w - 1, Math.ceil((band.x1Pct / 100) * w));
+    const bandW = x1 - x0 + 1;
+    if (bandW <= 0 || y1 <= y0) return sig;
+    const cellW = Math.max(1, Math.floor(bandW / cellCount));
+    const data = frame.data;
+    for (let c = 0; c < cellCount; c++) {
+      const cx0 = x0 + c * cellW;
+      const cx1 = Math.min(x1, cx0 + cellW - 1);
+      let sum = 0, count = 0;
+      for (let y = y0; y <= y1; y++) {
+        for (let x = cx0; x <= cx1; x++) {
+          const i = (y * w + x) * 4;
+          sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          count++;
+        }
+      }
+      sig[c] = count > 0 ? sum / count : 0;
+    }
+    return sig;
+  }
+
+  // Cosine-distance-style change score between two signatures (0 = same,
+  // higher = more different). Normalized RMS difference scaled to [0, 1].
+  function signatureDistance(a, b) {
+    if (!a || !b || a.length !== b.length) return 1;
+    let sumSq = 0;
+    for (let i = 0; i < a.length; i++) sumSq += (a[i] - b[i]) ** 2;
+    return Math.sqrt(sumSq / a.length) / 255;
+  }
+
   async function detectRegions(video, opts) {
     opts = opts || {};
     const sampleCount = opts.sampleCount || 14;
     const analysisWidth = opts.analysisWidth || 320;
     const onProgress = opts.onProgress || function () {};
     const categories = Object.assign({ captions: true, logos: true, watermarks: false }, opts.categories || {});
+    // Dense sampling for sentence-change detection within caption windows.
+    // Default ~1 sample per 1.5s of detected caption window. Bypass with 0.
+    const sentenceSampleSecs = opts.sentenceSampleSecs ?? 1.2;
 
     if (!video.duration || !isFinite(video.duration) || !video.videoWidth) {
       throw new Error("Video metadata not loaded yet");
@@ -317,12 +447,114 @@
     }
 
     onProgress({ stage: "analyzing", index: 1, total: 1, message: "Classifying captions, logos, and watermarks…" });
-    const bandsBySample = categories.captions ? samples.map((s) => findCaptionBand(s.frame, w, h)) : samples.map(() => null);
+    // Per-sample multi-band caption detection: each entry is an array of
+    // bands (one per text line). Empty array = no caption in this sample.
+    const bandsListBySample = categories.captions
+      ? samples.map((s) => findCaptionBands(s.frame, w, h))
+      : samples.map(() => []);
     const logoCorner = categories.logos ? findStaticLogo(samples, w, h) : null;
     const watermark = categories.watermarks ? findStaticWatermark(samples, w, h) : null;
     const captionRegions = categories.captions
-      ? groupCaptionRanges(bandsBySample, samples, tEnd)
+      ? groupCaptionRanges(bandsListBySample, samples, tEnd)
       : [];
+
+    // ─── Sentence-change refinement pass ──────────────────
+    // If captions were detected and dense sampling is enabled, walk each
+    // caption region and densely sample frames inside it. When the
+    // pixel-content signature of the caption band shifts substantially
+    // between dense samples, split that one region into multiple shorter
+    // regions — one per detected sentence.
+    let refinedCaptionRegions = captionRegions;
+    if (categories.captions && sentenceSampleSecs > 0 && captionRegions.length > 0) {
+      onProgress({ stage: "sentence-pass", index: 1, total: 1, message: "Detecting sentence changes…" });
+      refinedCaptionRegions = [];
+      for (const cap of captionRegions) {
+        // We only do sentence detection per LINE region; multi-line regions
+        // already get one row each from groupCaptionRanges.
+        const windowDur = cap.endSeconds - cap.startSeconds;
+        const denseCount = Math.max(2, Math.ceil(windowDur / sentenceSampleSecs));
+        if (denseCount < 3) { refinedCaptionRegions.push(cap); continue; }
+
+        // Sample evenly across the window and record band signature each time.
+        const dense = [];
+        for (let i = 0; i < denseCount; i++) {
+          const t = cap.startSeconds + ((i + 0.5) * windowDur) / denseCount;
+          if (t < tStart || t > tEnd) continue;
+          await seekTo(video, t);
+          ctx.drawImage(video, 0, 0, w, h);
+          let frame;
+          try { frame = ctx.getImageData(0, 0, w, h); } catch (_) { continue; }
+          const bands = findCaptionBands(frame, w, h);
+          if (bands.length === 0) { dense.push({ t, present: false, sig: null }); continue; }
+          // Match the band closest to this caption's vertical position
+          // (lineIndex was lost in the cap shape; we have y0Pct on cap).
+          bands.sort((a, b) => Math.abs(a.y0Pct - cap.yPct) - Math.abs(b.y0Pct - cap.yPct));
+          const band = bands[0];
+          dense.push({ t, present: true, sig: captionBandSignature(frame, w, h, band) });
+        }
+
+        // Walk dense samples; cut into sub-regions where signature distance
+        // crosses a threshold (caption text changed). Also cut at absences.
+        const changeThreshold = 0.06; // tuned roughly — 0.06 ≈ ~15 luma RMS
+        const cuts = [];
+        let runStart = -1, lastSig = null;
+        for (let i = 0; i <= dense.length; i++) {
+          const item = dense[i];
+          const present = item && item.present;
+          if (present && runStart < 0) { runStart = i; lastSig = item.sig; continue; }
+          if (present && runStart >= 0) {
+            const dist = signatureDistance(lastSig, item.sig);
+            if (dist > changeThreshold) {
+              // Sentence boundary: close current run, start new one HERE.
+              cuts.push({ start: runStart, end: i - 1 });
+              runStart = i;
+            }
+            lastSig = item.sig;
+            continue;
+          }
+          // !present: close the current run if any.
+          if (runStart >= 0) { cuts.push({ start: runStart, end: i - 1 }); runStart = -1; lastSig = null; }
+        }
+
+        // ─── Static-text rejection ─────────────────────────
+        // If the band's signature never changes across dense samples AND
+        // we got 3+ samples, this is almost certainly static on-screen text
+        // (a title card, a lower-third graphic, persistent slide content) —
+        // not a caption. Caption text changes when sentences change.
+        //
+        // We measure max signature distance across consecutive present
+        // samples. A real caption typically shows ≥ 0.04 (≈ 10 luma RMS)
+        // somewhere in the window; persistent text stays under that.
+        const presentSigs = dense.filter((d) => d.present);
+        if (presentSigs.length >= 3) {
+          let maxAdjDist = 0;
+          for (let k = 1; k < presentSigs.length; k++) {
+            const dist = signatureDistance(presentSigs[k - 1].sig, presentSigs[k].sig);
+            if (dist > maxAdjDist) maxAdjDist = dist;
+          }
+          // Threshold deliberately lower than the sentence-cut threshold
+          // (0.06) so wobble from compression noise doesn't promote static
+          // text to "caption". 0.025 ≈ 6 luma RMS.
+          if (maxAdjDist < 0.025) {
+            // Drop this region entirely — it's static text, leave it visible.
+            continue;
+          }
+        }
+
+        if (cuts.length <= 1) { refinedCaptionRegions.push(cap); continue; }
+
+        // Emit one region per cut, geometry inherited from the parent cap.
+        for (const c of cuts) {
+          const cutStart = dense[c.start]?.t ?? cap.startSeconds;
+          const cutEnd   = dense[c.end]?.t   ?? cap.endSeconds;
+          refinedCaptionRegions.push({
+            ...cap,
+            startSeconds: Math.max(cap.startSeconds, cutStart - 0.2),
+            endSeconds:   Math.min(cap.endSeconds,   cutEnd + 0.2),
+          });
+        }
+      }
+    }
 
     const out = [];
     if (logoCorner) {
@@ -349,7 +581,7 @@
         confidence: Math.min(0.95, 0.55 + watermark.density),
       });
     }
-    out.push(...captionRegions);
+    out.push(...refinedCaptionRegions);
     onProgress({ stage: "done", index: 1, total: 1, message: `Found ${out.length} region${out.length === 1 ? "" : "s"}` });
     return out;
   }

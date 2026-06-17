@@ -44,9 +44,14 @@ function detectionToRegions(detected, fps, totalSeconds) {
         confidence: d.confidence,
       };
     }
+    // Captions now come one-per-line. lineCount tells us how many lines
+    // were detected together; lineIndex (0 = top) identifies this region.
+    const lineLabel = d.lineCount > 1
+      ? `line ${d.lineIndex + 1} of ${d.lineCount}`
+      : "1 line";
     return {
       id: `auto-caption-${idx + 1}`,
-      name: `Burned-in caption (auto · ${d.lineCount} line${d.lineCount > 1 ? "s" : ""})`,
+      name: `Burned-in caption (auto · ${lineLabel})`,
       type: "caption", cls: "r-caption",
       x: d.xPct, y: d.yPct, w: d.wPct, h: d.hPct,
       method: "inpaint", opacity: 100, feather: 12,
@@ -297,7 +302,7 @@ const RegionBox = ({ region, selected, onSelect, onChange, locked }) => {
         const clampedDx = clamp(dx, -minX, 100 - maxX);
         const clampedDy = clamp(dy, -minY, 100 - maxY);
         const next = s.points.map((p) => ({ x: p.x + clampedDx, y: p.y + clampedDy }));
-        onChange({ ...region, points: next });
+        onChange({ ...region, points: next, userEdited: true });
         return;
       }
       // Rectangle handle drags.
@@ -311,7 +316,7 @@ const RegionBox = ({ region, selected, onSelect, onChange, locked }) => {
         if (s.handle.includes("n")) { rh = Math.max(2, rh - dy); ry = clamp(ry + dy, 0, ry + rh - 2); }
         if (s.handle.includes("s")) { rh = clamp(rh + dy, 2, 100 - ry); }
       }
-      onChange({ ...region, x: rx, y: ry, w: rw, h: rh });
+      onChange({ ...region, x: rx, y: ry, w: rw, h: rh, userEdited: true });
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -771,7 +776,17 @@ const VideoStage = ({ regions, selectedId, onSelectRegion, onChangeRegion, mode,
 const LeftRail = ({
   regions, selectedId, onSelect, onToggleVisible, onDelete, onAdd, onJumpTo, fps,
   notes = [], selectedNoteId, onSelectNote, onJumpToNote, onEditNote, onDeleteNote, onAddNote,
+  captions = [], selectedCueId, onSelectCue, onJumpToCue, onChangeCue, onDeleteCue, onAddCue,
+  onAutoCaption, onScanText, autoCaptionStatus, autoCaptionError,
 }) => {
+  // Format seconds → "M:SS" for caption rows (notes use frame-based formatTime
+  // below; captions are stored in seconds so they don't need the fps round-trip).
+  const formatSec = (s) => {
+    if (!isFinite(s)) return "—";
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${String(sec).padStart(2, "0")}`;
+  };
   const formatTime = (frame) => {
     const s = frame / fps;
     const m = Math.floor(s / 60);
@@ -838,77 +853,198 @@ const LeftRail = ({
         </button>
       </div>
 
-      {/* Audio descriptions — same surface as regions so users add, jump,
-          and delete notes without having to find the timeline track first.
-          Stage rendering for notes stays as the timeline pip + firing
-          overlay; this section is the primary editing surface. */}
+      {/* ─── Accessibility track ───────────────────────────
+          One unified surface for the CC cues (what gets visibly burned
+          into the cleaned output) AND audio descriptions (audio-only
+          insertions for moments where on-screen content isn't covered
+          by the dialogue). They share a panel because authoring a
+          description means scanning gaps in the caption transcript —
+          they're two halves of the same accessibility track. The
+          stage overlay still renders ONLY captions (descriptions are
+          audio-only by design and never show as visible text). */}
       <div style={{ borderTop: "1px solid var(--line)", padding: "14px 14px 8px" }}>
         <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: ".08em", color: "var(--ink-3)", marginBottom: 4, display: "flex", alignItems: "center", gap: 6 }}>
-          <Icons.Speaker size={11} sw={2} /> Audio descriptions
+          <Icons.Speaker size={11} sw={2} /> Accessibility track
         </div>
         <div style={{ fontSize: 12, color: "var(--ink-3)" }}>
-          {notes.length} {notes.length === 1 ? "note" : "notes"}
+          {captions.length} caption{captions.length === 1 ? "" : "s"} · {notes.length} description{notes.length === 1 ? "" : "s"}
+          {captions.some((c) => c.source === "whisper") && <span style={{ marginLeft: 6 }}>· transcribed</span>}
         </div>
-      </div>
-      <div className="regions-list">
-        {notes.map((n) => {
-          const isDraft = !!n.draft;
-          return (
-            <div
-              key={n.id}
-              className={`region-item ${n.id === selectedNoteId ? "active" : ""}`}
-              style={{
-                opacity: isDraft ? 0.85 : 1,
-                borderLeft: isDraft ? "2px dashed var(--accent)" : undefined,
-              }}
-              title="Click to jump to this note · double-click to edit"
-              onClick={() => { onSelectNote?.(n.id); onJumpToNote?.(n); }}
-              onDoubleClick={() => onEditNote?.(n)}
-            >
-              <div className="swatch" style={{ background: "var(--warn)" }} />
-              <div className="info">
-                <div className="name" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {n.text || "(empty note)"}
-                </div>
-                <div className="meta">
-                  {formatTime(n.frame)} → {formatTime(n.frame + n.durationFrames)}
-                  · {(n.durationFrames / fps).toFixed(1)}s
-                  {n.mode === "pause" && <span style={{ marginLeft: 6, color: "var(--accent)" }}>· pauses video</span>}
-                  {isDraft && <span style={{ marginLeft: 6, color: "var(--ink-3)" }}>· draft</span>}
-                </div>
-              </div>
-              <button
-                className="eye"
-                title="Edit note"
-                onClick={(e) => { e.stopPropagation(); onEditNote?.(n); }}
-                style={{ marginRight: 4 }}
-              >
-                <Icons.Code size={12} sw={1.5} />
-              </button>
-              <button
-                className="eye"
-                title="Delete note"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (window.confirm(`Delete this audio note?\n\n"${(n.text || "").slice(0, 80)}"`)) onDeleteNote?.(n.id);
-                }}
-              >
-                ×
-              </button>
-            </div>
-          );
-        })}
-        {notes.length === 0 && (
-          <div className="empty-state" style={{ padding: "20px 18px" }}>
-            <div style={{ fontSize: 12, color: "var(--ink-3)", lineHeight: 1.5 }}>
-              No audio notes yet. Add one at the current playhead for moments that need a verbal description.
-            </div>
+        {autoCaptionStatus && (
+          <div style={{ marginTop: 8, padding: "6px 8px", borderRadius: 6, background: "var(--overlay-surface)", border: "1px solid var(--overlay-border)", fontSize: 11, color: "var(--ink)", display: "flex", alignItems: "center", gap: 8 }}>
+            <div aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 999, border: "2px solid var(--accent)", borderTopColor: "transparent", animation: "spin 0.8s linear infinite", flex: "none" }} />
+            <span>{autoCaptionStatus.message}</span>
+          </div>
+        )}
+        {autoCaptionError && (
+          <div role="alert" style={{ marginTop: 8, padding: "6px 8px", borderRadius: 6, background: "rgba(239,83,80,.12)", border: "1px solid rgba(239,83,80,.4)", fontSize: 11, color: "var(--ink)" }}>
+            <strong>Transcribe failed.</strong> {autoCaptionError}
           </div>
         )}
       </div>
-      <div className="left-add" style={{ borderTop: "1px solid var(--line)" }}>
-        <button className="btn" onClick={() => onAddNote?.()}>
-          <Icons.Plus size={13} /> Audio note
+      <div className="regions-list">
+        {/* Build a unified, time-sorted list. Each item carries `kind`
+            ("caption" | "description") and we render the appropriate
+            row UI. Descriptions keep their existing modal-edit flow;
+            captions stay inline-editable. */}
+        {(() => {
+          const items = [
+            ...captions.map((c) => ({ kind: "caption", startSec: c.startSeconds, endSec: c.endSeconds, raw: c })),
+            ...notes.map((n)    => ({ kind: "description", startSec: n.frame / fps, endSec: (n.frame + n.durationFrames) / fps, raw: n })),
+          ].sort((a, b) => a.startSec - b.startSec);
+
+          if (items.length === 0) {
+            return (
+              <div className="empty-state" style={{ padding: "20px 18px" }}>
+                <div style={{ fontSize: 12, color: "var(--ink-3)", lineHeight: 1.5 }}>
+                  Empty accessibility track. Use <strong>Transcribe</strong> to generate captions from the audio, then add audio descriptions in any gaps where on-screen text isn't covered by the dialogue.
+                </div>
+              </div>
+            );
+          }
+
+          return items.map((item) => {
+            if (item.kind === "caption") {
+              const cue = item.raw;
+              const isActive = cue.id === selectedCueId;
+              return (
+                <div
+                  key={`cap-${cue.id}`}
+                  className={`region-item ${isActive ? "active" : ""}`}
+                  title="Caption · click to jump · type to edit"
+                  onClick={() => { onSelectCue?.(cue.id); onJumpToCue?.(cue); }}
+                >
+                  <div
+                    className="swatch"
+                    style={{ background: cue.source === "whisper" ? "var(--accent)" : "var(--ink-3)" }}
+                    aria-label="Caption row"
+                    title="Caption (visible text)"
+                  />
+                  <div className="info" style={{ flex: 1, minWidth: 0 }}>
+                    <input
+                      type="text"
+                      value={cue.text}
+                      placeholder="(empty caption · type text)"
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => onChangeCue?.(cue.id, { text: e.target.value })}
+                      style={{ width: "100%", background: "transparent", border: "none", color: "var(--ink)", fontSize: 13, padding: 0, marginBottom: 2, outline: "none" }}
+                      aria-label="Caption text"
+                    />
+                    <div className="meta" style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11 }}>
+                      <span style={{ padding: "0 4px", borderRadius: 3, background: "rgba(63,140,255,.18)", color: "var(--ink-2)", fontSize: 10, textTransform: "uppercase", letterSpacing: ".06em" }}>CC</span>
+                      <input
+                        type="number" step="0.1" min="0"
+                        value={cue.startSeconds.toFixed(2)}
+                        onClick={(e) => e.stopPropagation()}
+                        onChange={(e) => {
+                          const v = parseFloat(e.target.value);
+                          if (!isNaN(v)) onChangeCue?.(cue.id, { startSeconds: Math.max(0, v) });
+                        }}
+                        style={{ width: 56, fontSize: 11, padding: "1px 4px", background: "var(--surface)", border: "1px solid var(--line)", color: "var(--ink)", borderRadius: 3 }}
+                        aria-label="Caption start (seconds)"
+                      />→
+                      <input
+                        type="number" step="0.1" min="0"
+                        value={cue.endSeconds.toFixed(2)}
+                        onClick={(e) => e.stopPropagation()}
+                        onChange={(e) => {
+                          const v = parseFloat(e.target.value);
+                          if (!isNaN(v)) onChangeCue?.(cue.id, { endSeconds: Math.max(cue.startSeconds + 0.1, v) });
+                        }}
+                        style={{ width: 56, fontSize: 11, padding: "1px 4px", background: "var(--surface)", border: "1px solid var(--line)", color: "var(--ink)", borderRadius: 3 }}
+                        aria-label="Caption end (seconds)"
+                      />
+                      <span style={{ color: "var(--ink-3)" }}>· {(cue.endSeconds - cue.startSeconds).toFixed(1)}s</span>
+                      {cue.source === "whisper" && <span style={{ marginLeft: 4, color: "var(--accent)" }}>· auto</span>}
+                    </div>
+                  </div>
+                  <button
+                    className="eye"
+                    title="Delete caption"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (window.confirm(`Delete this caption?\n\n"${(cue.text || "").slice(0, 80)}"`)) onDeleteCue?.(cue.id);
+                    }}
+                  >×</button>
+                </div>
+              );
+            }
+            // Audio description row
+            const n = item.raw;
+            const isDraft = !!n.draft;
+            return (
+              <div
+                key={`desc-${n.id}`}
+                className={`region-item ${n.id === selectedNoteId ? "active" : ""}`}
+                style={{
+                  opacity: isDraft ? 0.85 : 1,
+                  borderLeft: isDraft ? "2px dashed var(--warn)" : undefined,
+                }}
+                title="Audio description (audio-only · never shown as caption) · click to jump · double-click to edit"
+                onClick={() => { onSelectNote?.(n.id); onJumpToNote?.(n); }}
+                onDoubleClick={() => onEditNote?.(n)}
+              >
+                <div
+                  className="swatch"
+                  style={{ background: "var(--warn)" }}
+                  aria-label="Audio description row"
+                  title="Audio description (audio-only)"
+                />
+                <div className="info">
+                  <div className="name" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {n.text || "(empty description)"}
+                  </div>
+                  <div className="meta" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <span style={{ padding: "0 4px", borderRadius: 3, background: "rgba(255,180,80,.18)", color: "var(--ink-2)", fontSize: 10, textTransform: "uppercase", letterSpacing: ".06em" }}>AD</span>
+                    {formatTime(n.frame)} → {formatTime(n.frame + n.durationFrames)}
+                    · {(n.durationFrames / fps).toFixed(1)}s
+                    {n.mode === "pause" && <span style={{ marginLeft: 4, color: "var(--accent)" }}>· pauses</span>}
+                    {isDraft && <span style={{ marginLeft: 4, color: "var(--ink-3)" }}>· draft</span>}
+                  </div>
+                </div>
+                <button
+                  className="eye"
+                  title="Edit description"
+                  onClick={(e) => { e.stopPropagation(); onEditNote?.(n); }}
+                  style={{ marginRight: 4 }}
+                ><Icons.Code size={12} sw={1.5} /></button>
+                <button
+                  className="eye"
+                  title="Delete description"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (window.confirm(`Delete this audio description?\n\n"${(n.text || "").slice(0, 80)}"`)) onDeleteNote?.(n.id);
+                  }}
+                >×</button>
+              </div>
+            );
+          });
+        })()}
+      </div>
+      <div className="left-add" style={{ borderTop: "1px solid var(--line)", display: "flex", gap: 6, flexWrap: "wrap" }}>
+        <button className="btn" onClick={() => onAddCue?.()} title="Add a caption cue at the current playhead">
+          <Icons.Plus size={13} /> Caption
+        </button>
+        <button className="btn" onClick={() => onAddNote?.()} title="Add an audio description (audio-only) at the current playhead">
+          <Icons.Plus size={13} /> Description
+        </button>
+        <button
+          className="btn"
+          onClick={() => onAutoCaption?.()}
+          disabled={!!autoCaptionStatus}
+          title="Transcribe audio to captions using Whisper (in-browser, ~80 MB first-time download)"
+          style={{ opacity: autoCaptionStatus ? 0.6 : 1 }}
+        >
+          <Icons.Sparkle size={13} /> {autoCaptionStatus ? "Transcribing…" : "Transcribe"}
+        </button>
+        <button
+          className="btn"
+          onClick={() => onScanText?.()}
+          disabled={!!autoCaptionStatus || captions.length === 0}
+          title="Scan caption gaps for on-screen text (OCR, in-browser) and draft audio descriptions for visible text the dialogue doesn't cover"
+          style={{ opacity: (autoCaptionStatus || captions.length === 0) ? 0.6 : 1 }}
+        >
+          <Icons.Sparkle size={13} /> Scan on-screen text
         </button>
       </div>
     </>
@@ -982,7 +1118,11 @@ const Inspector = ({ region, mode, onChange, onDelete, onCommitTrack, fps, durat
 
   // Detect/draw — full inspector.
   const r = region;
-  const set = (patch) => onChange({ ...r, ...patch });
+  // Any inspector edit marks the region as user-touched so Re-detect can
+  // preserve manual time/geometry adjustments instead of clobbering them.
+  // Auto-generated regions stay overwritable; once the user types a value
+  // in IN/OUT/X/Y/W/H or drags a vertex, the region is "theirs".
+  const set = (patch) => onChange({ ...r, ...patch, userEdited: true });
 
   return (
     <>
@@ -1526,7 +1666,7 @@ const PreDetectModal = ({ open, defaults, onConfirm, onCancel }) => {
   const [categories, setCategories] = useState(defaults);
   React.useEffect(() => { if (open) setCategories(defaults); }, [open, defaults]);
   if (!open) return null;
-  const anyChecked = categories.captions || categories.logos || categories.audioOpps;
+  const anyChecked = categories.captions || categories.logos || categories.watermarks || categories.audioOpps;
   const toggle = (k) => setCategories((c) => ({ ...c, [k]: !c[k] }));
   return (
     <div
@@ -1736,10 +1876,18 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
       if (scope === "global") {
         const newRegions = detectionToRegions(found, fps, v.duration);
         const newNotes = audioOpps.map(opportunityToNote);
-        if (newRegions.length > 0) {
-          setRegions(newRegions);
-          setSelectedId(newRegions[0].id);
-        }
+        // A global scan replaces the auto-detected set: drop every
+        // non-user-edited region — including the demo/seed regions for
+        // categories the user did NOT pick — and swap in only what this scan
+        // found. This MUST run even when newRegions is empty; otherwise seed
+        // logo/watermark regions linger and still get removed on export even
+        // though the user only selected captions. User-edited regions are
+        // preserved so manual work (IN/OUT, geometry, polygons) is never lost.
+        setRegions((prev) => {
+          const keepers = prev.filter((r) => r.userEdited);
+          return [...keepers, ...newRegions];
+        });
+        if (newRegions.length > 0) setSelectedId(newRegions[0].id);
         if (newNotes.length > 0) {
           setNotes((prev) => [...prev, ...newNotes]);
         }
@@ -1753,21 +1901,34 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
         setTimeout(() => setDetectStatus(null), 3500);
       } else {
         // Refit scope: merge the strongest caption into the named region.
+        // Re-fit is an explicit per-region user action, so it's OK to update
+        // bounds — but if the user has manually narrowed the time range,
+        // KEEP their narrower IN/OUT and only update geometry. Otherwise
+        // Re-fit would undo the very thing the user was trying to commit.
         const captionResult = found.find((d) => d.kind === "caption");
         if (!captionResult) {
           setDetectStatus({ message: "No captions found in that range — region kept as-is.", pct: 100 });
           setTimeout(() => setDetectStatus(null), 3000);
         } else {
-          setRegions((rs) => rs.map((reg) => reg.id === scope.regionId ? {
-            ...reg,
-            x: captionResult.xPct, y: captionResult.yPct,
-            w: captionResult.wPct, h: captionResult.hPct,
-            startFrame: Math.floor(captionResult.startSeconds * fps),
-            endFrame: Math.ceil(captionResult.endSeconds * fps),
-            confidence: captionResult.confidence,
-          } : reg));
-          setDetectStatus({ message: "Region refit to tighter geometry.", pct: 100 });
-          setTimeout(() => setDetectStatus(null), 2500);
+          setRegions((rs) => rs.map((reg) => {
+            if (reg.id !== scope.regionId) return reg;
+            const patch = {
+              x: captionResult.xPct, y: captionResult.yPct,
+              w: captionResult.wPct, h: captionResult.hPct,
+              confidence: captionResult.confidence,
+            };
+            // Only widen / tighten time bounds if user hasn't pinned them.
+            if (!reg.userEdited) {
+              patch.startFrame = Math.floor(captionResult.startSeconds * fps);
+              patch.endFrame   = Math.ceil(captionResult.endSeconds * fps);
+            }
+            return { ...reg, ...patch };
+          }));
+          setDetectStatus({
+            message: "Region refit (geometry updated · IN/OUT preserved if you edited them).",
+            pct: 100,
+          });
+          setTimeout(() => setDetectStatus(null), 3000);
         }
       }
     } catch (e) {
@@ -1838,6 +1999,183 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
   const [selectedNoteId, setSelectedNoteId] = useState(null);
   const [showRecorder, setShowRecorder] = useState(false);
   const [editingNote, setEditingNote] = useState(null);
+
+  /* ─── Caption cues (replacement closed captions) ────
+   * Cue shape: { id, startSeconds, endSeconds, text, source }
+   *   source: "manual" | "whisper" | "import"
+   * These are NEW captions we generate or hand-author to REPLACE the
+   * burned-in open captions we're removing. They render as a real
+   * overlay on the video and can be exported as a WebVTT track. */
+  const [captions, setCaptions] = useState([]);
+  const [selectedCueId, setSelectedCueId] = useState(null);
+  const [autoCaption, setAutoCaption] = useState(null); // { stage, message, pct } | null
+  const [autoCaptionError, setAutoCaptionError] = useState(null);
+
+  const onAddCaption = useCallback((startOverride) => {
+    const start = startOverride ?? (videoRef.current?.currentTime ?? 0);
+    const dur = videoRef.current?.duration ?? 0;
+    const id = `cue-${Date.now()}`;
+    const cue = {
+      id,
+      startSeconds: start,
+      endSeconds: Math.min(dur, start + 3),
+      text: "",
+      source: "manual",
+    };
+    setCaptions((cs) => [...cs, cue].sort((a, b) => a.startSeconds - b.startSeconds));
+    setSelectedCueId(id);
+  }, []);
+
+  const onChangeCaption = useCallback((id, patch) => {
+    setCaptions((cs) => cs.map((c) => c.id === id ? { ...c, ...patch } : c)
+      .sort((a, b) => a.startSeconds - b.startSeconds));
+  }, []);
+
+  const onDeleteCaption = useCallback((id) => {
+    setCaptions((cs) => cs.filter((c) => c.id !== id));
+    setSelectedCueId((cur) => cur === id ? null : cur);
+  }, []);
+
+  const onJumpToCaption = useCallback((cue) => {
+    const v = videoRef.current;
+    if (v) v.currentTime = cue.startSeconds;
+    setSelectedCueId(cue.id);
+  }, []);
+
+  // Current cue under playhead (for the on-stage overlay).
+  // playhead is the editor's state object { frame, t } where t is seconds.
+  const currentTimeSec = typeof playhead === "object" && playhead ? (playhead.t ?? (playhead.frame / fps)) : (playhead || 0);
+  const activeCue = captions.find(
+    (c) => currentTimeSec >= c.startSeconds && currentTimeSec <= c.endSeconds
+  );
+
+  // Auto-transcribe entry point (Whisper via transformers.js, lazy-loaded).
+  // range: optional { startSeconds, endSeconds } to scope transcription to
+  // a window instead of the whole clip. Passed straight to transcribe.js;
+  // returned cue timestamps are already shifted to original-video time.
+  const runAutoCaption = useCallback(async (range) => {
+    setAutoCaptionError(null);
+    const rangeLabel = range
+      ? ` for ${Math.floor((range.startSeconds || 0) / 60)}:${String(Math.floor((range.startSeconds || 0) % 60)).padStart(2, "0")}–${Math.floor((range.endSeconds || 0) / 60)}:${String(Math.floor((range.endSeconds || 0) % 60)).padStart(2, "0")}`
+      : "";
+    setAutoCaption({ stage: "init", message: `Loading speech model${rangeLabel} (one-time ~80 MB)…`, pct: 0 });
+    try {
+      if (typeof window.runWhisperCaption !== "function") {
+        // Lazy-load the transcriber wrapper on demand.
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = "transcribe.js";
+          s.onload = resolve;
+          s.onerror = () => reject(new Error("Could not load transcribe.js"));
+          document.body.appendChild(s);
+        });
+      }
+      if (typeof window.runWhisperCaption !== "function") {
+        throw new Error("Transcriber not available after load");
+      }
+      const cues = await window.runWhisperCaption(project?.videoSrc, {
+        startSeconds: range?.startSeconds,
+        endSeconds:   range?.endSeconds,
+        onProgress: (p) => setAutoCaption(p),
+      });
+      const stamped = cues.map((c, i) => ({
+        ...c,
+        id: `whisper-${Date.now()}-${i}`,
+        source: "whisper",
+      }));
+      // Merge with existing captions (don't clobber manual cues).
+      setCaptions((prev) => {
+        const manual = prev.filter((c) => c.source !== "whisper");
+        return [...manual, ...stamped].sort((a, b) => a.startSeconds - b.startSeconds);
+      });
+      setAutoCaption({
+        stage: "done",
+        message: `Generated ${stamped.length} caption${stamped.length === 1 ? "" : "s"}`,
+        pct: 100,
+      });
+
+      setTimeout(() => setAutoCaption(null), 5000);
+    } catch (e) {
+      setAutoCaptionError(e.message || String(e));
+      setAutoCaption(null);
+    }
+  }, [project?.videoSrc]);
+
+  // Manual on-screen text scan (opt-in). Finds gaps in the caption track,
+  // OCRs the middle of each gap, and drafts audio descriptions for visible
+  // text the dialogue doesn't cover. Lazy-loads ocr.js + Tesseract on first
+  // run. Kept separate from Transcribe so it never auto-fires — the user
+  // invokes it explicitly, which also avoids the frame-seek stall some
+  // embedded Chromium environments hit when OCR runs right after Whisper.
+  const runOCRScan = useCallback(async () => {
+    setAutoCaptionError(null);
+    const v = videoRef.current;
+    if (!v || !isFinite(v.duration)) {
+      setAutoCaptionError("Load a video before scanning for on-screen text.");
+      return;
+    }
+    setAutoCaption({ stage: "init", message: "Loading on-screen text scanner…", pct: 0 });
+    try {
+      if (typeof window.findUncoveredOnScreenText !== "function") {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = "ocr.js";
+          s.onload = resolve;
+          s.onerror = () => reject(new Error("Could not load ocr.js"));
+          document.body.appendChild(s);
+        });
+      }
+      if (typeof window.findUncoveredOnScreenText !== "function") {
+        throw new Error("OCR module not available after load");
+      }
+      const suggestions = await window.findUncoveredOnScreenText(
+        project?.videoSrc,
+        captions,
+        {
+          // ocr.js creates its own tiny blob-backed <video> for seeks so it
+          // doesn't fight the editor's playhead sync.
+          videoDurationSec: v.duration,
+          maxSamples: 10,
+          minGapSec: 3,
+          coverageThreshold: 0.4,
+          onProgress: (p) => setAutoCaption({
+            stage: p.stage,
+            message: `On-screen text: ${p.message}`,
+            pct: p.pct ?? 0,
+          }),
+        }
+      );
+
+      if (suggestions.length > 0) {
+        const draftNotes = suggestions.map((s, i) => ({
+          id: `ocr-${Date.now()}-${i}`,
+          frame: Math.round(s.sampleTime * fps),
+          durationFrames: Math.max(72, Math.round(s.detectedText.split(/\s+/).length * 0.35 * fps)),
+          text: `On-screen: "${s.detectedText.replace(/\n/g, " ").slice(0, 120)}" — not in dialogue`,
+          mode: "pause",
+          draft: true,
+          ocrConfidence: s.confidence,
+          ocrCoverage: s.coverageRatio,
+        }));
+        setNotes((prev) => [...prev, ...draftNotes].sort((a, b) => a.frame - b.frame));
+        setAutoCaption({
+          stage: "done",
+          message: `${draftNotes.length} draft description${draftNotes.length === 1 ? "" : "s"} from on-screen text`,
+          pct: 100,
+        });
+      } else {
+        setAutoCaption({
+          stage: "done",
+          message: "No uncovered on-screen text found in caption gaps",
+          pct: 100,
+        });
+      }
+      setTimeout(() => setAutoCaption(null), 5000);
+    } catch (ocrErr) {
+      setAutoCaptionError(`On-screen text scan failed: ${ocrErr.message}`);
+      setAutoCaption(null);
+    }
+  }, [project?.videoSrc, captions, fps]);
   // firing = { id, mode, startedAt, durationMs, wasPlaying }; null when nothing playing.
   const [firing, setFiring] = useState(null);
   const [firingProgress, setFiringProgress] = useState(0);
@@ -2052,6 +2390,17 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
             const v = videoRef.current;
             if (v && isFinite(v.duration)) v.currentTime = t;
           }}
+          captions={captions}
+          selectedCueId={selectedCueId}
+          onSelectCue={setSelectedCueId}
+          onJumpToCue={onJumpToCaption}
+          onChangeCue={onChangeCaption}
+          onDeleteCue={onDeleteCaption}
+          onAddCue={onAddCaption}
+          onAutoCaption={runAutoCaption}
+          onScanText={runOCRScan}
+          autoCaptionStatus={autoCaption}
+          autoCaptionError={autoCaptionError}
         />
       </div>
 
@@ -2060,6 +2409,34 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
         {/* Live stream status overlay (top-left) */}
         {(project?.source === "live" || project?.source === "url") && (
           <StreamStatus project={project} />
+        )}
+
+        {/* Replacement-caption overlay — shows the current cue's text
+            burned-in over the video so the user can preview what the
+            exported file's CC track will look like. */}
+        {activeCue?.text && (
+          <div
+            aria-live="off"
+            style={{
+              position: "absolute",
+              left: "50%", bottom: "8%",
+              transform: "translateX(-50%)",
+              maxWidth: "80%",
+              padding: "6px 14px",
+              background: "rgba(0,0,0,0.75)",
+              color: "#fff",
+              fontSize: "clamp(14px, 2vw, 22px)",
+              fontFamily: "system-ui, sans-serif",
+              lineHeight: 1.3,
+              textAlign: "center",
+              borderRadius: 4,
+              pointerEvents: "none",
+              zIndex: 5,
+              textShadow: "0 1px 2px rgba(0,0,0,0.9)",
+            }}
+          >
+            {activeCue.text}
+          </div>
         )}
 
         {/* Mode toolbar floating */}
