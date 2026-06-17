@@ -1742,8 +1742,13 @@ const PreDetectModal = ({ open, defaults, onConfirm, onCancel }) => {
 };
 
 const Editor = ({ project, onBack, onExport, tweaks }) => {
-  const [regions, setRegions] = useState(DEFAULT_REGIONS);
-  const [selectedId, setSelectedId] = useState("r1");
+  // Real uploaded videos start with NO regions. DEFAULT_REGIONS are demo
+  // overlays positioned for the bundled sample clip — they'd be wrong on any
+  // other video. They only seed the mock showcase projects (which have no
+  // videoSrc). On a real video, regions come solely from the user's
+  // category-scoped scan or manual drawing.
+  const [regions, setRegions] = useState(() => (project?.videoSrc ? [] : DEFAULT_REGIONS));
+  const [selectedId, setSelectedId] = useState(() => (project?.videoSrc ? null : "r1"));
   const [mode, setMode] = useState("detect"); // detect | draw | track | compare
   const [playhead, setPlayhead] = useState({ t: 0.36, frame: Math.floor(0.36 * 7200) });
   const [playing, setPlaying] = useState(false);
@@ -1995,7 +2000,10 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
   }, [totalFrames, fps]);
 
   /* ─── Audio notes state + trigger logic ─────────────── */
-  const [notes, setNotes] = useState(DEFAULT_NOTES);
+  // Like regions, DEFAULT_NOTES are demo descriptions tied to the sample clip.
+  // Real uploaded videos start with an empty accessibility track; notes come
+  // from Transcribe, the on-screen-text scan, or manual authoring.
+  const [notes, setNotes] = useState(() => (project?.videoSrc ? [] : DEFAULT_NOTES));
   const [selectedNoteId, setSelectedNoteId] = useState(null);
   const [showRecorder, setShowRecorder] = useState(false);
   const [editingNote, setEditingNote] = useState(null);
