@@ -16,6 +16,9 @@ _frame_*.png
 .continue/
 .specstory/
 
+# Personal MCP wiring — holds machine-specific paths. Sharers copy .mcp.json.example.
+.mcp.json
+
 # Self-hosted FFmpeg-WASM core (~32 MB). Recreated by setup.sh from unpkg.
 ffmpeg/
 
@@ -28,3 +31,9 @@ ffmpeg/
 node_modules/
 dist/
 .cache/
+
+# Local inpainting backend scratch (uploads + results) + Python caches
+server/_jobs/
+server/.venv/
+__pycache__/
+*.pyc

@@ -3,11 +3,343 @@
 
 const { useState, useEffect, useRef } = React;
 
+/* ─── Dwell activation ────────────────────────────────
+ * Pointer-dwell clicking for users who can aim but not press (head
+ * pointers, eye trackers, tremor). Hovering any activatable element for
+ * `dwellMs` fills a progress ring and then activates it. Returns a
+ * cleanup function; the caller owns on/off + timing state. */
+function startDwellEngine(dwellMs) {
+  const ring = document.createElement("div");
+  ring.className = "dwell-ring";
+  const CIRC = (2 * Math.PI * 15.5).toFixed(2);
+  ring.innerHTML =
+    `<svg viewBox="0 0 36 36" aria-hidden="true">` +
+    `<circle class="bg" cx="18" cy="18" r="15.5"/>` +
+    `<circle class="fg" cx="18" cy="18" r="15.5" stroke-dasharray="${CIRC}" stroke-dashoffset="${CIRC}"/>` +
+    `</svg>`;
+  document.body.appendChild(ring);
+  const fg = ring.querySelector(".fg");
+
+  let target = null, timer = null, raf = null, t0 = 0;
+  // How the current dwell was armed: "pointer" (hover) or "focus" (keyboard).
+  // Cancellation events are gated by source so unrelated mouse movement
+  // can't kill a keyboard dwell and vice versa.
+  let armSource = null;
+  // Last input modality — focus dwell only arms for KEYBOARD-driven focus.
+  // (A mouse click also focuses the button; without this gate, clicking
+  // Play would silently re-activate it dwellMs later.)
+  let modality = "pointer";
+
+  const cancel = () => {
+    target = null;
+    armSource = null;
+    clearTimeout(timer);
+    cancelAnimationFrame(raf);
+    ring.style.display = "none";
+  };
+  const tick = () => {
+    if (!target) return;
+    const p = Math.min(1, (performance.now() - t0) / dwellMs);
+    fg.style.strokeDashoffset = String(CIRC * (1 - p));
+    if (p < 1) raf = requestAnimationFrame(tick);
+  };
+  const ACTIVATABLE = "button, a[href], [role='button'], [role='slider'], input, textarea, label, .proj";
+  const FOCUS_IS_THE_ACTION = "input[type='text'], input[type='number'], textarea, [role='slider']";
+  const arm = (el, source) => {
+    cancel();
+    target = el;
+    armSource = source;
+    const r = el.getBoundingClientRect();
+    ring.style.display = "block";
+    ring.style.left = `${r.left + r.width / 2 - 14}px`;
+    ring.style.top = `${r.top - 32 < 0 ? r.bottom + 4 : r.top - 32}px`;
+    fg.style.strokeDashoffset = String(CIRC);
+    t0 = performance.now();
+    raf = requestAnimationFrame(tick);
+    timer = setTimeout(() => {
+      const el2 = target;
+      cancel();
+      if (!el2 || !document.contains(el2)) return;
+      // Text fields and sliders take focus (so keys work next);
+      // everything else gets a real click.
+      if (el2.matches(FOCUS_IS_THE_ACTION)) el2.focus();
+      else el2.click();
+    }, dwellMs);
+  };
+  const over = (e) => {
+    const el = e.target.closest?.(ACTIVATABLE);
+    if (!el || el === target) return;
+    arm(el, "pointer");
+  };
+  const out = (e) => {
+    if (armSource !== "pointer") return;
+    if (target && !(e.relatedTarget && target.contains(e.relatedTarget))) cancel();
+  };
+  const onFocusIn = (e) => {
+    if (modality !== "keyboard") return;
+    const el = e.target.closest?.(ACTIVATABLE);
+    if (!el || el === target) return;
+    // Focusing a field/slider IS its activation — nothing to dwell for.
+    if (el.matches(FOCUS_IS_THE_ACTION)) return;
+    arm(el, "focus");
+  };
+  const onFocusOut = (e) => {
+    if (armSource !== "focus") return;
+    if (target && !(e.relatedTarget && target.contains(e.relatedTarget))) cancel();
+  };
+  const onKey = (e) => {
+    if (e.key === "Escape") { cancel(); return; }
+    if (e.key === "Tab" || e.key.startsWith("Arrow") || e.key === "Enter" || e.key === " ") modality = "keyboard";
+  };
+  const onPointer = () => { modality = "pointer"; };
+  document.addEventListener("mouseover", over, true);
+  document.addEventListener("mouseout", out, true);
+  document.addEventListener("focusin", onFocusIn, true);
+  document.addEventListener("focusout", onFocusOut, true);
+  document.addEventListener("keydown", onKey, true);
+  document.addEventListener("mousedown", onPointer, true);
+  document.addEventListener("mousemove", onPointer, true);
+  return () => {
+    cancel();
+    document.removeEventListener("mouseover", over, true);
+    document.removeEventListener("mouseout", out, true);
+    document.removeEventListener("focusin", onFocusIn, true);
+    document.removeEventListener("focusout", onFocusOut, true);
+    document.removeEventListener("keydown", onKey, true);
+    document.removeEventListener("mousedown", onPointer, true);
+    document.removeEventListener("mousemove", onPointer, true);
+    ring.remove();
+  };
+}
+
+const DWELL_MIN_SECS = 1;
+const DWELL_MAX_SECS = 10;
+const DWELL_STEP_SECS = 0.5;
+const DWELL_DEFAULT_SECS = 3;
+
+/* ─── Service status + controls ───────────────────────
+ * The editor leans on local processes (the processing backend and the MCP
+ * chat bridge). This panel shows each one's live status and lets you START
+ * the ones a browser CAN start. The backend can't self-start (nothing's
+ * running to launch it), so we surface the exact command with a copy button;
+ * once it's up, the MCP bridge starts with one click. */
+const ServiceRow = ({ svc, busy, copied, onStart, onCopy }) => {
+  const color = svc.running ? "var(--accent)" : (svc.startable ? "var(--warn)" : "var(--pink)");
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: "1px solid var(--line)" }}>
+      <span aria-hidden="true" style={{
+        width: 9, height: 9, borderRadius: "50%", flex: "none", background: color,
+        boxShadow: svc.running ? `0 0 7px ${color}` : "none",
+      }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 13 }}>{svc.name} <span style={{ color: "var(--ink-4)", fontSize: 11 }}>:{svc.port}</span></div>
+        <div style={{ fontSize: 11, color: svc.running ? "var(--accent)" : "var(--ink-3)" }}>
+          {svc.running ? "Running" : "Stopped"}
+        </div>
+      </div>
+      {svc.running ? (
+        <span style={{ fontSize: 11, color: "var(--ink-4)" }}>✓</span>
+      ) : svc.startable ? (
+        <button className="btn" onClick={onStart} disabled={busy}>{busy ? "Starting…" : "Start"}</button>
+      ) : (
+        <button className="btn ghost" onClick={onCopy} title={svc.command} aria-label={`Copy start command for ${svc.name}`}>
+          {copied ? "Copied ✓" : "Copy start cmd"}
+        </button>
+      )}
+    </div>
+  );
+};
+
+const ServicesPanel = () => {
+  const [svcs, setSvcs] = useState(null);
+  const [busy, setBusy] = useState(null);
+  const [copied, setCopied] = useState(null);
+  const [err, setErr] = useState(null);
+
+  const load = async () => {
+    try {
+      await ensureFetchClient();
+      const s = await window.checkServices();
+      setSvcs(s); setErr(null);
+    } catch (e) { setErr(e.message); }
+  };
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => { if (alive) await load(); };
+    tick();
+    const iv = setInterval(tick, 5000);
+    return () => { alive = false; clearInterval(iv); };
+  }, []);
+
+  const start = async () => {
+    setBusy("mcp"); setErr(null);
+    try {
+      await window.startMcpService();
+      await new Promise((r) => setTimeout(r, 700));
+      await load();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(null); }
+  };
+  const copy = (key, cmd) => {
+    try { navigator.clipboard?.writeText(cmd); } catch (_) {}
+    setCopied(key); setTimeout(() => setCopied(null), 1600);
+  };
+
+  return (
+    <div>
+      {!svcs && <div style={{ fontSize: 12, color: "var(--ink-3)", padding: "6px 0" }}>Checking services…</div>}
+      {svcs && ["backend", "mcp", "page"].map((k) => (
+        <ServiceRow
+          key={k} svc={svcs[k]}
+          busy={busy === k} copied={copied === k}
+          onStart={start} onCopy={() => copy(k, svcs[k].command)}
+        />
+      ))}
+      {err && <div style={{ marginTop: 8, fontSize: 11, color: "var(--pink)" }}>{err}</div>}
+      <div style={{ marginTop: 8, fontSize: 11, color: "var(--ink-4)", lineHeight: 1.5 }}>
+        The processing backend can't be started from the browser — copy its command into a terminal. Once it's running, the MCP chat bridge starts with one click.
+      </div>
+    </div>
+  );
+};
+
+/* ─── Settings modal ──────────────────────────────────
+ * The Projects screen's Settings button was decorative in the prototype;
+ * this dialog makes it real. Everything here persists across sessions. */
+const SettingsModal = ({ open, onClose, theme, onTheme, dwellOn, onDwellOn, dwellSecs, onDwellSecs }) => {
+  const [endpoint, setEndpoint] = useState(() => {
+    try { return localStorage.getItem("unlogo:endpoint") || ""; } catch { return ""; }
+  });
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+  if (!open) return null;
+
+  const saveEndpoint = (v) => {
+    setEndpoint(v);
+    try {
+      if (v.trim()) localStorage.setItem("unlogo:endpoint", v.trim());
+      else localStorage.removeItem("unlogo:endpoint");
+    } catch {}
+  };
+  const clearRecent = () => {
+    if (!window.confirm("Clear your edited-videos list? Saved regions and notes for those projects are removed. The video files themselves are untouched.")) return;
+    try { localStorage.removeItem("unlogo:recent"); } catch {}
+  };
+  const row = {
+    display: "flex", alignItems: "center", justifyContent: "space-between",
+    gap: 12, padding: "11px 0", borderBottom: "1px solid var(--line)",
+  };
+  const hint = { fontSize: 11, color: "var(--ink-3)", lineHeight: 1.5 };
+
+  return (
+    <div
+      role="dialog" aria-modal="true" aria-label="Settings"
+      style={{
+        position: "fixed", inset: 0, zIndex: 60,
+        background: "rgba(0,0,0,.45)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+      }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          width: "min(470px, calc(100vw - 32px))",
+          background: "var(--bg)", border: "1px solid var(--line)",
+          borderRadius: 10, boxShadow: "var(--shadow)", padding: 20,
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+          <h2 style={{ margin: 0, fontSize: 17, fontWeight: 500 }}>Settings</h2>
+          <button className="btn ghost" onClick={onClose} aria-label="Close settings"><Icons.X size={14} /></button>
+        </div>
+
+        <div style={{ ...row, flexDirection: "column", alignItems: "stretch", gap: 2, borderBottom: "none", paddingBottom: 2 }}>
+          <div style={{ fontSize: 13, marginBottom: 2 }}>Local services</div>
+          <div style={hint}>Status of the backend processes this editor uses. Start the stopped ones.</div>
+          <ServicesPanel />
+        </div>
+
+        <div style={row}>
+          <div>
+            <div style={{ fontSize: 13 }}>Theme</div>
+            <div style={hint}>Night: purple actions · Day: orange actions</div>
+          </div>
+          <div className="seg" role="radiogroup" aria-label="Theme">
+            <button className={theme === "night" ? "active" : ""} role="radio" aria-checked={theme === "night"} onClick={() => onTheme("night")}>Night</button>
+            <button className={theme === "day" ? "active" : ""} role="radio" aria-checked={theme === "day"} onClick={() => onTheme("day")}>Day</button>
+          </div>
+        </div>
+
+        <div style={row}>
+          <div>
+            <div style={{ fontSize: 13 }}>Dwell activation</div>
+            <div style={hint}>Hover — or Tab to — a control and hold still to activate it. Esc cancels.</div>
+          </div>
+          <button
+            className="btn ghost" role="switch" aria-checked={dwellOn}
+            onClick={() => onDwellOn(!dwellOn)}
+            style={dwellOn ? { borderColor: "var(--accent)", color: "var(--accent)" } : undefined}
+          >
+            {dwellOn ? "On" : "Off"}
+          </button>
+        </div>
+
+        <div style={row}>
+          <div>
+            <div style={{ fontSize: 13 }}>Dwell time</div>
+            <div style={hint}>{DWELL_MIN_SECS}–{DWELL_MAX_SECS}s · also adjustable anywhere with the + / − keys</div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <button className="btn ghost" aria-label="Decrease dwell time by half a second" onClick={() => onDwellSecs(-DWELL_STEP_SECS)}>−</button>
+            <span style={{ fontFamily: "Geist Mono, monospace", fontSize: 12, minWidth: 38, textAlign: "center" }} role="status" aria-live="polite">
+              {dwellSecs.toFixed(1)}s
+            </span>
+            <button className="btn ghost" aria-label="Increase dwell time by half a second" onClick={() => onDwellSecs(DWELL_STEP_SECS)}>+</button>
+          </div>
+        </div>
+
+        <div style={{ ...row, flexDirection: "column", alignItems: "stretch", gap: 6 }}>
+          <label htmlFor="set-endpoint" style={{ fontSize: 13 }}>Local processing backend</label>
+          <input
+            id="set-endpoint" className="num-input" type="text"
+            placeholder="http://127.0.0.1:8770"
+            value={endpoint}
+            onChange={(e) => saveEndpoint(e.target.value)}
+          />
+          <div style={hint}>Server used for caption removal and audio-description muxing. Leave empty for the default.</div>
+        </div>
+
+        <div style={{ ...row, borderBottom: "none" }}>
+          <div>
+            <div style={{ fontSize: 13 }}>Edited-videos list</div>
+            <div style={hint}>Remove all saved projects — video files on disk are untouched</div>
+          </div>
+          <button className="btn ghost" onClick={clearRecent}>Clear list</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 /* ─── TopBar ──────────────────────────────────────────── */
-const TopBar = ({ screen, project, onHome, onNew, onExport, hasProject, theme, onToggleTheme }) => {
+const TopBar = ({ screen, project, onHome, onNew, onExport, hasProject, theme, onToggleTheme,
+                  dwellOn, dwellSecs, onToggleDwell, onDwellSecs, services, onOpenServices }) => {
   const projectName = project?.name;
   const isLive = project?.source === "live";
   const isUrl = project?.source === "url";
+  // At-a-glance service health: green all-up, amber backend-up/MCP-down,
+  // red backend down. Click opens the Services panel in Settings.
+  const svcColor = !services ? "var(--ink-4)"
+    : !services.backend.running ? "var(--pink)"
+    : services.mcp.running ? "var(--accent)" : "var(--warn)";
+  const svcLabel = !services ? "Services"
+    : !services.backend.running ? "Backend off"
+    : services.mcp.running ? "Services up" : "MCP off";
   return (
     <div className="topbar">
       <button className="brand" onClick={onHome} style={{ cursor: "pointer" }}>
@@ -40,6 +372,45 @@ const TopBar = ({ screen, project, onHome, onNew, onExport, hasProject, theme, o
         )}
       </div>
       <div className="right">
+        <button
+          className="btn ghost"
+          onClick={onOpenServices}
+          title="Backend service status — click to manage"
+          aria-label={`Services: ${svcLabel}. Open service controls.`}
+          style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+        >
+          <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: "50%", background: svcColor, boxShadow: svcColor !== "var(--ink-4)" ? `0 0 5px ${svcColor}` : "none" }} />
+          {svcLabel}
+        </button>
+        <div className="dwell-ctl" title="Dwell activation: hover an element — or Tab to it — and hold still to activate it. Esc cancels a pending dwell.">
+          <button
+            className={`btn ghost ${dwellOn ? "active" : ""}`}
+            aria-pressed={dwellOn}
+            onClick={onToggleDwell}
+            style={dwellOn ? { borderColor: "var(--accent)", color: "var(--accent)" } : undefined}
+          >
+            <Icons.Pin size={12} sw={2} /> Dwell
+          </button>
+          {dwellOn && (
+            <>
+              <button
+                className="btn ghost"
+                aria-label="Decrease dwell time by half a second"
+                onClick={() => onDwellSecs(-DWELL_STEP_SECS)}
+                style={{ padding: "5px 8px" }}
+              >−</button>
+              <span className="secs" role="status" aria-live="polite" aria-label={`Dwell time ${dwellSecs} seconds`}>
+                {dwellSecs.toFixed(1)}s
+              </span>
+              <button
+                className="btn ghost"
+                aria-label="Increase dwell time by half a second"
+                onClick={() => onDwellSecs(DWELL_STEP_SECS)}
+                style={{ padding: "5px 8px" }}
+              >+</button>
+            </>
+          )}
+        </div>
         <div className="theme-toggle" title="Theme">
           <button
             className={theme === "night" ? "active" : ""}
@@ -95,204 +466,213 @@ const TopBar = ({ screen, project, onHome, onNew, onExport, hasProject, theme, o
 
 /* ─── Projects screen ─────────────────────────────────── */
 
-const SAMPLE_PROJECTS = [
-  {
-    id: "p1",
-    name: "Conference Recording — Day 2",
-    scene: "conference",
-    duration: "12:48",
-    status: "done",
-    regions: 2,
-    updated: "2 hours ago",
-    thumbRegions: [
-      { id: "tr1", type: "broadcaster", x: 3, y: 78, w: 14, h: 10, visible: true },
-      { id: "tr2", type: "caption", x: 8, y: 80, w: 84, h: 14, visible: true },
-    ],
-  },
-  {
-    id: "p2",
-    name: "Travel Vlog 014 — Tokyo Streets",
-    scene: "tokyo",
-    duration: "08:15",
-    status: "processing",
-    regions: 3,
-    updated: "Yesterday",
-    thumbRegions: [
-      { id: "tr1", type: "logo", x: 80, y: 4, w: 17, h: 14, visible: true },
-      { id: "tr2", type: "watermark", x: 35, y: 32, w: 28, h: 12, visible: true },
-    ],
-  },
-  {
-    id: "p3",
-    name: "Tutorial intro — Captions burned in",
-    scene: "tutorial",
-    duration: "04:32",
-    status: "draft",
-    regions: 1,
-    updated: "3 days ago",
-    thumbRegions: [
-      { id: "tr1", type: "caption", x: 8, y: 80, w: 84, h: 14, visible: true },
-    ],
-  },
-  {
-    id: "p4",
-    name: "Mountain Pass — Sunset cut",
-    scene: "nature",
-    duration: "1:24:11",
-    status: "done",
-    regions: 1,
-    updated: "Last week",
-    source: "file",
-    thumbRegions: [
-      { id: "tr1", type: "watermark", x: 12, y: 12, w: 30, h: 13, visible: true },
-    ],
-  },
-  {
-    id: "p5",
-    name: "Twitch · Restream live · 3h 12m",
-    scene: "tokyo",
-    duration: "LIVE",
-    status: "live",
-    regions: 2,
-    updated: "Streaming now",
-    source: "live",
-    platform: "twitch",
-    thumbRegions: [
-      { id: "tr1", type: "logo", x: 80, y: 4, w: 17, h: 14, visible: true },
-      { id: "tr2", type: "broadcaster", x: 3, y: 80, w: 14, h: 10, visible: true },
-    ],
-  },
-];
+/* Recent real edits, persisted by the editor (localStorage key below). The
+ * demo cards are gone — this list is the user's own videos, newest first.
+ * Video bytes can't live in localStorage, so reopening a project asks the
+ * user to re-attach the file, then restores every region / note / caption. */
+const RECENT_KEY = "unlogo:recent";
 
-const Projects = ({ onOpenProject, onNew }) => (
-  <div className="projects-wrap">
-    <div className="projects-head">
-      <div>
-        <h1>Projects</h1>
-        <div className="sub">Pick up where you left off, or start a fresh clean-up.</div>
-      </div>
-      <div style={{ display: "flex", gap: 8 }}>
-        <button className="btn ghost"><Icons.Folder size={13} /> Import folder</button>
-        <button className="btn"><Icons.Settings size={13} /> Settings</button>
-      </div>
-    </div>
+/* Tiny IndexedDB k/v for File System Access handles. A stored handle lets a
+ * project card reopen its video DIRECTLY (one browser permission prompt at
+ * most) instead of bouncing through a file-picker dialog. Handles are
+ * Chromium-only; every path falls back to the re-attach picker. */
+const idb = {
+  open: () => new Promise((res, rej) => {
+    const req = indexedDB.open("unlogo", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("videos");
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  }),
+  async get(key) {
+    try {
+      const db = await this.open();
+      return await new Promise((res, rej) => {
+        const rq = db.transaction("videos", "readonly").objectStore("videos").get(key);
+        rq.onsuccess = () => res(rq.result);
+        rq.onerror = () => rej(rq.error);
+      });
+    } catch { return undefined; }
+  },
+  async set(key, val) {
+    try {
+      const db = await this.open();
+      await new Promise((res, rej) => {
+        const rq = db.transaction("videos", "readwrite").objectStore("videos").put(val, key);
+        rq.onsuccess = res;
+        rq.onerror = () => rej(rq.error);
+      });
+    } catch { /* storage failure must never block editing */ }
+  },
+};
+const loadRecent = () => {
+  try { return JSON.parse(localStorage.getItem(RECENT_KEY) || "[]"); } catch { return []; }
+};
+const fmtDurShort = (s) => {
+  if (!isFinite(s) || s <= 0) return "—";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = Math.floor(s % 60);
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")}`
+    : `${m}:${String(ss).padStart(2, "0")}`;
+};
+const fmtWhen = (ts) => {
+  const mins = Math.round((Date.now() - ts) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs} hour${hrs === 1 ? "" : "s"} ago`;
+  return new Date(ts).toLocaleDateString();
+};
 
-    <div className="proj-grid">
-      <div className="proj new-card" onClick={onNew}>
-        <div className="plus">+</div>
-        <div className="label">New project</div>
-        <div className="hint">Drag a video or click to upload</div>
+const Projects = ({ onOpenProject, onNew, onOpenSettings }) => {
+  const [recent, setRecent] = useState(loadRecent);
+  const fileRef = useRef(null);
+  const pendingRef = useRef(null);
+
+  // Reopen flow. Fast path: a stored File System Access handle reopens the
+  // video straight into the editor — at most a one-click browser permission
+  // prompt, no file dialog. Fallback (no handle / denied / non-Chromium):
+  // the re-attach picker.
+  const openEntry = async (entry) => {
+    try {
+      const handle = await idb.get(entry.id);
+      if (handle && handle.kind === "file") {
+        let perm = "granted";
+        if (handle.queryPermission) {
+          perm = await handle.queryPermission({ mode: "read" });
+          if (perm !== "granted" && handle.requestPermission) {
+            perm = await handle.requestPermission({ mode: "read" });
+          }
+        }
+        if (perm === "granted") {
+          const file = await handle.getFile();
+          onOpenProject({
+            source: "file", scene: "tokyo",
+            name: entry.name,
+            videoSrc: URL.createObjectURL(file),
+            fileSize: file.size,
+            restore: entry,
+          });
+          return;
+        }
+      }
+    } catch (_) { /* fall through to the picker */ }
+    pendingRef.current = entry;
+    fileRef.current?.click();
+  };
+  const onReattach = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    const entry = pendingRef.current;
+    pendingRef.current = null;
+    if (!file || !entry) return;
+    if (entry.fileSize && file.size !== entry.fileSize && !window.confirm(
+      `"${file.name}" doesn't look like the same file as "${entry.name}". Open it with this project's edits anyway?`
+    )) return;
+    onOpenProject({
+      source: "file", scene: "tokyo",
+      name: entry.name,
+      videoSrc: URL.createObjectURL(file),
+      fileSize: file.size,
+      restore: entry,
+    });
+  };
+  const removeEntry = (id) => {
+    setRecent((list) => {
+      const next = list.filter((x) => x.id !== id);
+      try { localStorage.setItem(RECENT_KEY, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
+
+  return (
+    <div className="projects-wrap">
+      <div className="projects-head">
+        <div>
+          <h1>Projects</h1>
+          <div className="sub">Your edited videos, newest first. Open one to re-attach the file and continue.</div>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn ghost" onClick={onNew} title="Import a video to start a project">
+            <Icons.Folder size={13} /> Import folder
+          </button>
+          <button className="btn" onClick={onOpenSettings}><Icons.Settings size={13} /> Settings</button>
+        </div>
       </div>
-      {SAMPLE_PROJECTS.map((p) => (
-        <div key={p.id} className="proj" onClick={() => onOpenProject(p)}>
-          <div className="thumb">
-            <MockScene
-              scene={p.scene}
-              regions={p.thumbRegions}
-              cleaned={p.status === "done"}
-              fontScale={0.6}
-            />
-            {p.status === "processing" && (
-              <div style={{
-                position: "absolute", inset: 0,
-                display: "flex", alignItems: "center", justifyContent: "center",
-                background: "rgba(0,0,0,.55)",
-                color: "var(--accent)",
-                fontFamily: "Geist Mono, monospace", fontSize: 11, letterSpacing: ".05em",
-                zIndex: 2,
-              }}>
-                <span style={{
-                  display: "inline-block", width: 8, height: 8, borderRadius: "50%",
-                  background: "var(--accent)", marginRight: 6,
-                  animation: "pulse 1.4s ease-in-out infinite",
-                }} />
-                CLEANING · 67%
+
+      <input
+        ref={fileRef} type="file" accept="video/*"
+        style={{ display: "none" }} onChange={onReattach}
+        aria-hidden="true" tabIndex={-1}
+      />
+
+      <div className="proj-grid">
+        <div
+          className="proj new-card" onClick={onNew}
+          role="button" tabIndex={0}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onNew(); } }}
+        >
+          <div className="plus">+</div>
+          <div className="label">New project</div>
+          <div className="hint">Drag a video or click to upload</div>
+        </div>
+        {recent.map((p) => (
+          <div
+            key={p.id} className="proj"
+            role="button" tabIndex={0}
+            onClick={() => openEntry(p)}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openEntry(p); } }}
+          >
+            <div className="thumb" style={{ display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg-2)" }}>
+              <Icons.Layers size={26} style={{ color: "var(--ink-4)" }} />
+              <span className="duration" style={{ zIndex: 2 }}>{fmtDurShort(p.durationSec)}</span>
+            </div>
+            <div className="body">
+              <div className="name">{p.name}</div>
+              <div className="meta">
+                <span>{(p.regions || []).length} region{(p.regions || []).length === 1 ? "" : "s"}</span>
+                <span style={{ color: "var(--ink-4)" }}>·</span>
+                <span>{(p.notes || []).length + (p.captions || []).length} notes/cues</span>
+                <span style={{ color: "var(--ink-4)" }}>·</span>
+                <span>{fmtWhen(p.updatedAt)}</span>
+                <button
+                  className="btn ghost"
+                  style={{ marginLeft: "auto", padding: "2px 7px", fontSize: 10 }}
+                  aria-label={`Remove ${p.name} from the project list`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (window.confirm(`Remove "${p.name}" from your project list? (The video file itself is untouched.)`)) removeEntry(p.id);
+                  }}
+                >Remove</button>
               </div>
-            )}
-            {p.status === "live" && (
-              <div style={{
-                position: "absolute", top: 8, left: 8, zIndex: 2,
-                display: "inline-flex", alignItems: "center", gap: 5,
-                background: "rgba(15,17,22,.9)", backdropFilter: "blur(6px)",
-                padding: "3px 7px", borderRadius: 4,
-                fontFamily: "Geist Mono, monospace", fontSize: 10,
-                color: "#ff8a87", border: "1px solid rgba(239,83,80,.4)",
-              }}>
-                <span style={{
-                  width: 6, height: 6, borderRadius: "50%",
-                  background: "var(--danger)",
-                  animation: "live-pulse 1.4s ease-in-out infinite",
-                }} />
-                LIVE
-              </div>
-            )}
-            <span className="duration" style={{
-              zIndex: 2,
-              ...(p.status === "live" ? { background: "rgba(239,83,80,.85)", color: "#fff", fontWeight: 600 } : {}),
-            }}>{p.duration}</span>
-            {p.status === "done" && (
-              <span style={{
-                position: "absolute", top: 8, left: 8, zIndex: 2,
-                display: "inline-flex", alignItems: "center", gap: 5,
-                background: "rgba(15,17,22,.85)", backdropFilter: "blur(6px)",
-                padding: "3px 7px", borderRadius: 4,
-                fontFamily: "Geist Mono, monospace", fontSize: 10,
-                color: "var(--accent)", border: "1px solid rgba(110,231,168,.3)",
-              }}>
-                <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
-                CLEANED
-              </span>
-            )}
-          </div>
-          <div className="body">
-            <div className="name">{p.name}</div>
-            <div className="meta">
-              <span>{p.regions} region{p.regions === 1 ? "" : "s"}</span>
-              <span style={{ color: "var(--ink-4)" }}>·</span>
-              <span>{p.updated}</span>
-              <span style={{ marginLeft: "auto" }}>
-                {p.status === "done" && <span className="chip dot" style={{ fontSize: 10 }}>done</span>}
-                {p.status === "draft" && <span className="chip warn dot" style={{ fontSize: 10 }}>draft</span>}
-                {p.status === "live" && (
-                  <span style={{
-                    display: "inline-flex", alignItems: "center", gap: 4,
-                    fontSize: 10, fontFamily: "Geist Mono, monospace",
-                    color: "#ff8a87",
-                  }}>
-                    <span style={{
-                      width: 5, height: 5, borderRadius: "50%",
-                      background: "var(--danger)",
-                      animation: "live-pulse 1.4s ease-in-out infinite",
-                    }} />
-                    streaming
-                  </span>
-                )}
-              </span>
             </div>
           </div>
-        </div>
-      ))}
+        ))}
+        {recent.length === 0 && (
+          <div style={{ gridColumn: "1 / -1", padding: "26px 6px", color: "var(--ink-3)", fontSize: 12.5, lineHeight: 1.6 }}>
+            No edited videos yet. Start a new project — every video you edit shows up
+            here automatically with its regions, notes and captions saved.
+          </div>
+        )}
+      </div>
     </div>
-
-    <style>{`@keyframes pulse { 0%,100% { opacity: .4; } 50% { opacity: 1; } }`}</style>
-  </div>
-);
+  );
+};
 
 /* ─── Upload screen ───────────────────────────────────── */
 
 // Platform detector — tells which embed source the URL looks like.
 // Order matters: "direct" is checked first so a real .mp4/.m3u8 wins over any
-// hostname rule. YuJa is split out from the original Kaltura row because UCSC
-// MediaSpace (media.ucsc.edu/V/Video?v=…) actually runs on YuJa, not Kaltura,
-// and the two platforms have different APIs.
+// hostname rule. YuJa is split out from the original Kaltura row because some
+// institutional MediaSpace instances (the /V/Video?v=… path) actually run on
+// YuJa, not Kaltura, and the two platforms have different APIs.
 const PLATFORMS = [
   { id: "direct",  name: "Direct video", re: /\.(mp4|m4v|mov|webm|ogg|m3u8|mpd)(\?.*)?$/i, sample: "https://example.com/video.mp4" },
-  { id: "yuja",    name: "YuJa",     re: /(yuja\.com|media\.ucsc\.edu|\/V\/Video\?v=)/i, sample: "https://media.ucsc.edu/V/Video?v=15809927" },
+  { id: "yuja",    name: "YuJa",     re: /(yuja\.com|\/V\/Video\?v=)/i, sample: "https://example.yuja.com/V/Video?v=123456" },
   { id: "youtube", name: "YouTube",  re: /(?:youtube\.com|youtu\.be)/i,    sample: "https://youtube.com/watch?v=dQw4w9WgXcQ" },
   { id: "vimeo",   name: "Vimeo",    re: /vimeo\.com/i,                    sample: "https://vimeo.com/76979871" },
   // Kaltura covers Kaltura.com, MediaSpace instances, and KAF (Kaltura
   // Application Framework) — the institutional white-labels that actually
-  // run Kaltura under the hood. UCSC is excluded; see the YuJa row above.
+  // run Kaltura under the hood. YuJa instances are excluded; see the YuJa row above.
   { id: "kaltura", name: "Kaltura",  re: /(kaltura\.com|mediaspace|kaf\.|kalturas\.com|video\.[a-z-]+\.edu)/i, sample: "https://cdnapisec.kaltura.com/p/1234567/sp/123456700/playManifest/entryId/0_abcdefgh/format/applehttp/protocol/https/a.m3u8" },
   { id: "tiktok",  name: "TikTok",   re: /tiktok\.com/i,                   sample: "https://tiktok.com/@user/video/7" },
   { id: "twitch",  name: "Twitch",   re: /twitch\.tv/i,                    sample: "https://twitch.tv/videos/123" },
@@ -325,23 +705,69 @@ const PlatformIcon = ({ id, size = 12 }) => {
 
 const detectPlatform = (url) => PLATFORMS.find((p) => p.re.test(url));
 
+// Lazy-load inpaint.js (holds fetchRemoteVideo) the same way the editor does.
+const ensureFetchClient = async () => {
+  if (typeof window.fetchRemoteVideo === "function") return;
+  await new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "inpaint.js";
+    s.onload = resolve;
+    s.onerror = () => reject(new Error("Could not load inpaint.js"));
+    document.body.appendChild(s);
+  });
+};
+
 const Upload = ({ onStart }) => {
   const [tab, setTab] = useState("file");
   const [drag, setDrag] = useState(false);
   const [url, setUrl] = useState("");
+  const [importState, setImportState] = useState(null); // { pct, message }
+  const [importError, setImportError] = useState(null);
   const fileInputRef = useRef(null);
 
   const detected = url ? detectPlatform(url) : null;
   const placeholder = "Paste a YouTube, Vimeo, TikTok, Twitch or X link…";
 
+  // Import a URL for real: the local backend (yt-dlp) resolves + downloads
+  // it, and we hand the editor a genuine video blob. Direct CORS-friendly
+  // media still plays straight from <video> if the backend is unreachable.
+  const importUrl = async () => {
+    if (!detected || importState) return;
+    setImportError(null);
+    setImportState({ pct: 0, message: "Starting import…" });
+    try {
+      await ensureFetchClient();
+      const { url: blobUrl, blob } = await window.fetchRemoteVideo(url, {
+        onProgress: (p) => setImportState({ pct: p.pct ?? 0, message: p.message || "Fetching…" }),
+      });
+      onStart({
+        source: "url", platform: detected.id, url,
+        videoSrc: blobUrl, fileSize: blob.size,
+        scene: "tokyo", name: "From " + detected.name,
+      });
+    } catch (err) {
+      // Fallback: a direct, CORS-friendly media URL can still play in-browser.
+      if (isDirectMedia(url) && /could not reach the local backend/i.test(err.message || "")) {
+        onStart({ source: "url", platform: detected.id, url, videoSrc: url, scene: "tokyo", name: "From " + detected.name });
+        return;
+      }
+      setImportError(err.message || String(err));
+      setImportState(null);
+    }
+  };
+
   // Read the first dropped/selected file as an Object URL and hand it to the
-  // editor as a real videoSrc. The original prototype skipped this and just
-  // shipped a hardcoded "Untitled.mp4" placeholder.
-  const handleFile = (file) => {
+  // editor as a real videoSrc. When the browser gave us a File System Access
+  // handle, stash it so the Projects screen can reopen this video directly
+  // (no re-attach picker) next session.
+  const handleFile = (file, handle) => {
     if (!file) return;
     if (!/^video\//i.test(file.type) && !/\.(mp4|m4v|mov|webm|mkv|ogg|avi)$/i.test(file.name)) {
       // Not obviously a video — still let it through but warn in the console.
       console.warn("[Unlogo] File type does not look like video:", file.type, file.name);
+    }
+    if (handle && handle.kind === "file") {
+      idb.set(`${file.name}::${file.size}`, handle);
     }
     const objectUrl = URL.createObjectURL(file);
     onStart({
@@ -351,6 +777,21 @@ const Upload = ({ onStart }) => {
       videoSrc: objectUrl,
       fileSize: file.size,
     });
+  };
+
+  // Prefer showOpenFilePicker (Chromium) — it yields a reopenable handle.
+  // Fallback: the classic hidden <input type=file>.
+  const browse = async () => {
+    if (typeof window.showOpenFilePicker === "function") {
+      try {
+        const [handle] = await window.showOpenFilePicker({
+          types: [{ description: "Videos", accept: { "video/*": [".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".ogg"] } }],
+        });
+        handleFile(await handle.getFile(), handle);
+      } catch (_) { /* user cancelled the picker */ }
+      return;
+    }
+    fileInputRef.current?.click();
   };
 
   return (
@@ -380,9 +821,17 @@ const Upload = ({ onStart }) => {
           aria-label="Upload a video file. Click to browse, or drag and drop."
           onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
           onDragLeave={() => setDrag(false)}
-          onDrop={(e) => { e.preventDefault(); setDrag(false); handleFile(e.dataTransfer?.files?.[0]); }}
-          onClick={() => fileInputRef.current?.click()}
-          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInputRef.current?.click(); } }}
+          onDrop={(e) => {
+            e.preventDefault(); setDrag(false);
+            // Grab both synchronously — the dataTransfer is neutered after
+            // the handler returns; the handle promise itself may resolve later.
+            const file = e.dataTransfer?.files?.[0];
+            const item = e.dataTransfer?.items?.[0];
+            const handleP = item?.getAsFileSystemHandle ? item.getAsFileSystemHandle() : Promise.resolve(null);
+            handleP.then((h) => handleFile(file, h)).catch(() => handleFile(file, null));
+          }}
+          onClick={browse}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); browse(); } }}
         >
           <input
             ref={fileInputRef}
@@ -414,23 +863,34 @@ const Upload = ({ onStart }) => {
               autoFocus
               placeholder={placeholder}
               value={url}
+              disabled={!!importState}
               onChange={(e) => setUrl(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && detected) {
-                  onStart({ source: "url", platform: detected.id, url, videoSrc: isDirectMedia(url) ? url : undefined, scene: "tokyo", name: "From " + detected.name });
-                }
-              }}
+              onKeyDown={(e) => { if (e.key === "Enter") importUrl(); }}
             />
             <button
               className="btn primary"
-              disabled={!detected}
-              onClick={() => detected && onStart({ source: "url", platform: detected.id, url, videoSrc: isDirectMedia(url) ? url : undefined, scene: "tokyo", name: "From " + detected.name })}
-              style={{ opacity: detected ? 1 : 0.5 }}
+              disabled={!detected || !!importState}
+              onClick={importUrl}
+              style={{ opacity: (detected && !importState) ? 1 : 0.5 }}
             >
               <Icons.Sparkle size={13} />
-              Import &amp; clean
+              {importState ? "Importing…" : "Import & clean"}
             </button>
           </div>
+
+          {importState && (
+            <div style={{ marginTop: 12 }} role="status" aria-live="polite">
+              <div style={{ fontSize: 12, color: "var(--ink-2)", marginBottom: 6 }}>{importState.message}</div>
+              <div style={{ height: 6, borderRadius: 3, background: "var(--bg-2)", overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${importState.pct}%`, background: "var(--accent)", transition: "width .2s" }} />
+              </div>
+            </div>
+          )}
+          {importError && (
+            <div style={{ marginTop: 12, padding: "10px 12px", borderRadius: 8, background: "rgba(239,83,80,.08)", border: "1px solid rgba(239,83,80,.25)", fontSize: 12, color: "var(--ink-2)", lineHeight: 1.5 }}>
+              <b style={{ color: "#ff8a87" }}>Import failed.</b> {importError}
+            </div>
+          )}
 
           <div className="platforms">
             {PLATFORMS.map((p) => (
@@ -483,7 +943,7 @@ const Upload = ({ onStart }) => {
           )}
 
           <div style={{ marginTop: 14, fontSize: 11, color: "var(--ink-4)", lineHeight: 1.5 }}>
-            We stream the source, run delogo on the fly, and serve a clean playable URL. Nothing is re-uploaded.
+            The local backend (yt-dlp) downloads the source to your machine, then it opens in the editor like any other video. Requires the server running with yt-dlp installed. Only import content you have the right to download and modify.
           </div>
         </div>
       )}
@@ -1333,6 +1793,26 @@ const TweaksLayer = () => {
 const App = () => {
   const [screen, setScreen] = useState("projects");
   const [project, setProject] = useState(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  // Poll local service health for the TopBar status pill. The Services panel
+  // in Settings re-polls faster while it's open.
+  const [services, setServices] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      try {
+        await ensureFetchClient();
+        const s = await window.checkServices();
+        if (alive) setServices(s);
+      } catch (_) { /* leave last-known status */ }
+    };
+    tick();
+    const onBridge = () => tick();
+    window.addEventListener("unlogo:bridge", onBridge);
+    const iv = setInterval(tick, 8000);
+    return () => { alive = false; clearInterval(iv); window.removeEventListener("unlogo:bridge", onBridge); };
+  }, []);
   const [exportedRegions, setExportedRegions] = useState(DEFAULT_REGIONS);
   const [theme, setTheme] = useState(() => {
     try { return localStorage.getItem("unlogo:theme") || "night"; }
@@ -1343,6 +1823,41 @@ const App = () => {
     document.documentElement.dataset.theme = theme;
     try { localStorage.setItem("unlogo:theme", theme); } catch {}
   }, [theme]);
+
+  // Dwell activation: on/off + dwell seconds, persisted. The engine itself
+  // is DOM-level (see startDwellEngine) and rebuilt when timing changes.
+  const [dwellOn, setDwellOn] = useState(() => {
+    try { return localStorage.getItem("unlogo:dwell") === "1"; } catch { return false; }
+  });
+  const [dwellSecs, setDwellSecs] = useState(() => {
+    try {
+      const v = parseFloat(localStorage.getItem("unlogo:dwellSecs"));
+      return isFinite(v) && v >= DWELL_MIN_SECS && v <= DWELL_MAX_SECS ? v : DWELL_DEFAULT_SECS;
+    } catch { return DWELL_DEFAULT_SECS; }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("unlogo:dwell", dwellOn ? "1" : "0");
+      localStorage.setItem("unlogo:dwellSecs", String(dwellSecs));
+    } catch {}
+  }, [dwellOn, dwellSecs]);
+  useEffect(() => {
+    if (!dwellOn) return;
+    return startDwellEngine(dwellSecs * 1000);
+  }, [dwellOn, dwellSecs]);
+  const adjustDwell = (delta) =>
+    setDwellSecs((s) => Math.min(DWELL_MAX_SECS, Math.max(DWELL_MIN_SECS, Math.round((s + delta) * 2) / 2)));
+  // Global + / − keys adjust the dwell time (skipped while typing in a field).
+  useEffect(() => {
+    if (!dwellOn) return;
+    const onKey = (e) => {
+      if (/^(input|textarea|select)$/i.test(e.target?.tagName || "")) return;
+      if (e.key === "+" || e.key === "=") adjustDwell(DWELL_STEP_SECS);
+      else if (e.key === "-" || e.key === "_") adjustDwell(-DWELL_STEP_SECS);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [dwellOn]);
 
   // Quick-launch entrypoint: `?video=URL` boots straight into the editor with
   // that URL as the <video> source. Useful for testing with a manifest pulled
@@ -1366,6 +1881,28 @@ const App = () => {
     } catch {}
   }, []);
 
+  // App-level command surface for the AI bridge (bridge.js). Unlike the
+  // editor's UnlogoAPI, these work from any screen — import_url in
+  // particular has to run before a video is open.
+  useEffect(() => {
+    window.UnlogoApp = {
+      importUrl: async ({ url }) => {
+        if (!url) throw new Error("url is required");
+        await ensureFetchClient();
+        const { url: blobUrl, blob } = await window.fetchRemoteVideo(url);
+        const detected = PLATFORMS.find((p) => p.re.test(url));
+        setProject({
+          source: "url", platform: detected?.id || "url", url,
+          videoSrc: blobUrl, fileSize: blob.size,
+          scene: "tokyo", name: "From " + (detected?.name || "URL"),
+        });
+        setScreen("editor");
+        return { name: "From " + (detected?.name || "URL"), bytes: blob.size };
+      },
+    };
+    return () => { delete window.UnlogoApp; };
+  }, []);
+
   return (
     <div className="app">
       <TopBar
@@ -1377,16 +1914,29 @@ const App = () => {
         onExport={() => setScreen("export")}
         theme={theme}
         onToggleTheme={setTheme}
+        dwellOn={dwellOn}
+        dwellSecs={dwellSecs}
+        onToggleDwell={() => setDwellOn((v) => !v)}
+        onDwellSecs={adjustDwell}
+        services={services}
+        onOpenServices={() => setSettingsOpen(true)}
       />
       <div className="screen">
         {screen === "projects" && (
           <Projects
             onOpenProject={(p) => { setProject(p); setScreen("editor"); }}
             onNew={() => setScreen("upload")}
+            onOpenSettings={() => setSettingsOpen(true)}
           />
         )}
         {screen === "upload" && (
-          <Upload onStart={(meta) => { setProject(meta); setScreen("detect"); }} />
+          <Upload onStart={(meta) => {
+            setProject(meta);
+            // A real video goes straight to the editor (which offers real
+            // detection via the pre-detect modal). Only the demo/live flows
+            // with no source get the illustrative scan animation.
+            setScreen(meta.videoSrc ? "editor" : "detect");
+          }} />
         )}
         {screen === "detect" && (
           <Detecting scene={project?.scene} onDone={() => setScreen("editor")} />
@@ -1396,6 +1946,7 @@ const App = () => {
             project={project}
             onBack={() => setScreen("projects")}
             onExport={() => setScreen("export")}
+            onRegionsChange={setExportedRegions}
           />
         )}
         {screen === "export" && (
@@ -1408,6 +1959,16 @@ const App = () => {
           />
         )}
       </div>
+      <SettingsModal
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        theme={theme}
+        onTheme={setTheme}
+        dwellOn={dwellOn}
+        onDwellOn={setDwellOn}
+        dwellSecs={dwellSecs}
+        onDwellSecs={adjustDwell}
+      />
       <TweaksLayer />
     </div>
   );

@@ -11,6 +11,117 @@ const I = () => Icons;
  * supplied video element. Returns the new regions or throws on failure. */
 const cornerName = (n) => ({ tl: "top-left", tr: "top-right", bl: "bottom-left", br: "bottom-right" }[n] || n);
 
+/* ─── Region overlap + dedup ──────────────────────────────
+ * Two regions are "the same thing" when they share a type, sit in roughly
+ * the same place on the frame, AND cover roughly the same time window.
+ * Re-running detection on a clip should EDIT those existing regions
+ * (refresh geometry, confidence) instead of stacking duplicates next to
+ * what was already there. User-edited regions are sacrosanct: the new
+ * scan skips anything that overlaps them so manual work stays intact. */
+
+function rectIoU(a, b) {
+  const x1 = Math.max(a.x, b.x);
+  const y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.w, b.x + b.w);
+  const y2 = Math.min(a.y + a.h, b.y + b.h);
+  if (x2 <= x1 || y2 <= y1) return 0;
+  const inter = (x2 - x1) * (y2 - y1);
+  const union = a.w * a.h + b.w * b.h - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+function frameOverlapRatio(a, b) {
+  const aStart = a.startFrame ?? 0;
+  const aEnd   = a.endFrame   ?? 0;
+  const bStart = b.startFrame ?? 0;
+  const bEnd   = b.endFrame   ?? 0;
+  const start = Math.max(aStart, bStart);
+  const end   = Math.min(aEnd, bEnd);
+  if (end <= start) return 0;
+  const overlap = end - start;
+  const minDur = Math.min(aEnd - aStart, bEnd - bStart);
+  return minDur > 0 ? overlap / minDur : 0;
+}
+
+function regionsRefersToSameThing(a, b) {
+  if (a.type !== b.type) return false;
+  // 40% IoU + 50% time overlap is empirical — looser than "exactly the
+  // same rect" but tight enough to avoid collapsing two genuinely distinct
+  // caption lines that happen to be near each other.
+  return rectIoU(a, b) > 0.4 && frameOverlapRatio(a, b) > 0.5;
+}
+
+/* Same idea for audio-description notes: a re-run shouldn't stack near-
+ * duplicate notes on top of ones already in the list. Two notes count as
+ * "the same" when they sit within a second of each other AND their text
+ * has substantial word overlap. Confirmed (non-draft) notes always win. */
+
+function notesRefersToSameThing(a, b) {
+  const aFrame = a.frame ?? 0;
+  const bFrame = b.frame ?? 0;
+  if (Math.abs(aFrame - bFrame) > 30) return false; // ~1.25s @ 24fps
+  const norm = (s) => (s || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+  const aw = new Set(norm(a.text));
+  const bw = new Set(norm(b.text));
+  if (aw.size === 0 || bw.size === 0) return Math.abs(aFrame - bFrame) < 12;
+  let common = 0;
+  for (const w of aw) if (bw.has(w)) common++;
+  const ratio = common / Math.min(aw.size, bw.size);
+  return ratio > 0.4;
+}
+
+function mergeNoteList(existing, incoming) {
+  const result = existing.slice();
+  for (const n of incoming) {
+    const idx = result.findIndex((e) => notesRefersToSameThing(e, n));
+    if (idx < 0) {
+      result.push(n);
+      continue;
+    }
+    // Confirmed (non-draft, user-touched) notes always win.
+    if (!result[idx].draft) continue;
+    // Both drafts: keep the existing id (stable React keys) but adopt
+    // the newer note's fields — usually a fresher OCR read or
+    // tighter pause boundary.
+    result[idx] = { ...result[idx], ...n, id: result[idx].id };
+  }
+  return result.sort((a, b) => (a.frame ?? 0) - (b.frame ?? 0));
+}
+
+/**
+ * Merge `incoming` regions into `existing`, deduplicating by overlap.
+ *  - Overlap with a user-edited existing: SKIP the incoming one (user wins).
+ *  - Overlap with an auto-detected existing: REFRESH that existing one's
+ *    geometry, time bounds, and confidence (keeping its id + user-visible
+ *    name + per-region settings like method, opacity, feather).
+ *  - No overlap: APPEND.
+ * Also collapses duplicates inside `incoming` itself, since each iteration
+ * checks against `result` which contains everything we've kept so far.
+ */
+function mergeRegionList(existing, incoming) {
+  const result = existing.slice();
+  for (const r of incoming) {
+    const idx = result.findIndex((e) => regionsRefersToSameThing(e, r));
+    if (idx < 0) {
+      result.push(r);
+      continue;
+    }
+    if (result[idx].userEdited) continue;
+    result[idx] = {
+      ...result[idx],
+      x: r.x, y: r.y, w: r.w, h: r.h,
+      startFrame: r.startFrame,
+      endFrame:   r.endFrame,
+      confidence: r.confidence,
+    };
+  }
+  return result;
+}
+
 function detectionToRegions(detected, fps, totalSeconds) {
   return detected.map((d, idx) => {
     if (d.kind === "logo") {
@@ -143,32 +254,37 @@ const fmtTC = (frames, fps = 24) => {
   return `${mm}:${ss}:${ff}`;
 };
 
-/* Parse a flexible time string into seconds.
- *   "1:23"      → 83
- *   "01:23"     → 83
- *   "1:02:03"   → 3723
- *   "45"        → 45
- *   "45.5"      → 45.5
+/* Parse a flexible time string into seconds. Sub-second precision comes from
+ * a FRAMES field (0..fps-1), matching the MM:SS:FF timecode the editor shows.
+ *   "45"          → 45
+ *   "45.5"        → 45.5
+ *   "1:23"        → 83            (MM:SS — SS may carry decimals: "1:23.5")
+ *   "05:45:16"    → 345 + 16/fps  (MM:SS:FF, frame-accurate)
+ *   "1:02:03:12"  → 3723 + 12/fps (HH:MM:SS:FF for hour-long sources)
  * Returns null on unparseable input. */
-const parseTC = (str) => {
+const parseTC = (str, fps = 24) => {
   const s = String(str || "").trim();
   if (!s) return null;
   if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
   const parts = s.split(":");
-  if (parts.length === 2 || parts.length === 3) {
-    const nums = parts.map((p) => parseFloat(p));
-    if (nums.some((n) => isNaN(n) || n < 0)) return null;
-    if (parts.length === 2) return nums[0] * 60 + nums[1];
-    return nums[0] * 3600 + nums[1] * 60 + nums[2];
-  }
-  return null;
+  if (parts.length < 2 || parts.length > 4) return null;
+  const nums = parts.map((p) => parseFloat(p));
+  if (nums.some((n) => isNaN(n) || n < 0)) return null;
+  if (parts.length === 2) return nums[0] * 60 + nums[1];
+  // Last field is FRAMES; clamp to the last legal frame of a second.
+  const ff = Math.min(Math.floor(nums[nums.length - 1]), fps - 1) / fps;
+  if (parts.length === 3) return nums[0] * 60 + nums[1] + ff;
+  return nums[0] * 3600 + nums[1] * 60 + nums[2] + ff;
 };
 
 /* TimecodeInput — a controlled-ish input that lets the user type freely,
  * parses on blur or Enter, clamps to [minSec, maxSec], and reverts on bad
  * input. Solves the stock prototype's "controlled regex fights typing" bug. */
 const TimecodeInput = ({ valueFrames, fps, minSec, maxSec, onCommit, className }) => {
-  const display = fmtTC(valueFrames, fps).slice(0, 5);
+  // Full MM:SS:FF — the FF (frames) field is the sub-second precision that
+  // frame-accurate removals need. parseTC still accepts looser input
+  // ("5:45", "345.5") for quick typing.
+  const display = fmtTC(valueFrames, fps);
   const [draft, setDraft] = React.useState(display);
   const [focused, setFocused] = React.useState(false);
 
@@ -178,7 +294,7 @@ const TimecodeInput = ({ valueFrames, fps, minSec, maxSec, onCommit, className }
   }, [display, focused]);
 
   const commit = () => {
-    const parsed = parseTC(draft);
+    const parsed = parseTC(draft, fps);
     if (parsed == null) {
       setDraft(display); // revert
       return;
@@ -187,7 +303,7 @@ const TimecodeInput = ({ valueFrames, fps, minSec, maxSec, onCommit, className }
     onCommit(clamped);
     // Show the canonical formatted value after commit (next prop sync will
     // overwrite draft, but do it eagerly so revert-to-clamped is visible).
-    setDraft(fmtTC(Math.round(clamped * fps), fps).slice(0, 5));
+    setDraft(fmtTC(Math.round(clamped * fps), fps));
   };
 
   return (
@@ -195,6 +311,8 @@ const TimecodeInput = ({ valueFrames, fps, minSec, maxSec, onCommit, className }
       className={className}
       type="text"
       inputMode="numeric"
+      title={`MM:SS:FF — FF is frames (0–${fps - 1})`}
+      placeholder="MM:SS:FF"
       value={draft}
       onChange={(e) => setDraft(e.target.value)}
       onFocus={(e) => { setFocused(true); e.target.select(); }}
@@ -777,7 +895,7 @@ const LeftRail = ({
   regions, selectedId, onSelect, onToggleVisible, onDelete, onAdd, onJumpTo, fps,
   notes = [], selectedNoteId, onSelectNote, onJumpToNote, onEditNote, onDeleteNote, onAddNote,
   captions = [], selectedCueId, onSelectCue, onJumpToCue, onChangeCue, onDeleteCue, onAddCue,
-  onAutoCaption, onScanText, autoCaptionStatus, autoCaptionError,
+  onAutoCaption, onScanText, onExtractCC, onDownloadSrt, autoCaptionStatus, autoCaptionError,
 }) => {
   // Format seconds → "M:SS" for caption rows (notes use frame-based formatTime
   // below; captions are stored in seconds so they don't need the fps round-trip).
@@ -932,28 +1050,26 @@ const LeftRail = ({
                     />
                     <div className="meta" style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11 }}>
                       <span style={{ padding: "0 4px", borderRadius: 3, background: "rgba(63,140,255,.18)", color: "var(--ink-2)", fontSize: 10, textTransform: "uppercase", letterSpacing: ".06em" }}>CC</span>
-                      <input
-                        type="number" step="0.1" min="0"
-                        value={cue.startSeconds.toFixed(2)}
-                        onClick={(e) => e.stopPropagation()}
-                        onChange={(e) => {
-                          const v = parseFloat(e.target.value);
-                          if (!isNaN(v)) onChangeCue?.(cue.id, { startSeconds: Math.max(0, v) });
-                        }}
-                        style={{ width: 56, fontSize: 11, padding: "1px 4px", background: "var(--surface)", border: "1px solid var(--line)", color: "var(--ink)", borderRadius: 3 }}
-                        aria-label="Caption start (seconds)"
-                      />→
-                      <input
-                        type="number" step="0.1" min="0"
-                        value={cue.endSeconds.toFixed(2)}
-                        onClick={(e) => e.stopPropagation()}
-                        onChange={(e) => {
-                          const v = parseFloat(e.target.value);
-                          if (!isNaN(v)) onChangeCue?.(cue.id, { endSeconds: Math.max(cue.startSeconds + 0.1, v) });
-                        }}
-                        style={{ width: 56, fontSize: 11, padding: "1px 4px", background: "var(--surface)", border: "1px solid var(--line)", color: "var(--ink)", borderRadius: 3 }}
-                        aria-label="Caption end (seconds)"
-                      />
+                      <span onClick={(e) => e.stopPropagation()}>
+                        <TimecodeInput
+                          className="num-input tc-mini"
+                          valueFrames={Math.round(cue.startSeconds * fps)}
+                          fps={fps}
+                          minSec={0}
+                          maxSec={Math.max(0, cue.endSeconds - 1 / fps)}
+                          onCommit={(sec) => onChangeCue?.(cue.id, { startSeconds: sec })}
+                        />
+                      </span>→
+                      <span onClick={(e) => e.stopPropagation()}>
+                        <TimecodeInput
+                          className="num-input tc-mini"
+                          valueFrames={Math.round(cue.endSeconds * fps)}
+                          fps={fps}
+                          minSec={cue.startSeconds + 1 / fps}
+                          maxSec={Number.MAX_SAFE_INTEGER}
+                          onCommit={(sec) => onChangeCue?.(cue.id, { endSeconds: sec })}
+                        />
+                      </span>
                       <span style={{ color: "var(--ink-3)" }}>· {(cue.endSeconds - cue.startSeconds).toFixed(1)}s</span>
                       {cue.source === "whisper" && <span style={{ marginLeft: 4, color: "var(--accent)" }}>· auto</span>}
                     </div>
@@ -1046,14 +1162,136 @@ const LeftRail = ({
         >
           <Icons.Sparkle size={13} /> Scan on-screen text
         </button>
+        <button
+          className="btn"
+          onClick={() => onExtractCC?.()}
+          disabled={!!autoCaptionStatus}
+          title="Read the burned-in captions (OCR): pass 1 builds deduplicated subtitle cues, pass 2 cuts removal shapes from the text geometry"
+          style={{ opacity: autoCaptionStatus ? 0.6 : 1 }}
+        >
+          <Icons.Sparkle size={13} /> Extract CC
+        </button>
+        <button
+          className="btn ghost"
+          onClick={() => onDownloadSrt?.()}
+          disabled={captions.length === 0}
+          title="Download the caption cues as an .srt subtitle file"
+          style={{ opacity: captions.length === 0 ? 0.6 : 1 }}
+        >
+          <Icons.Download size={13} /> SRT
+        </button>
       </div>
     </>
   );
 };
 
+/* ─── Before/after removal proof ───────────────────────
+ * Grabs the SAME frame (mid-point of the removed region's active window)
+ * from the original and the cleaned video and shows them side by side, with
+ * the region box outlined on both — so the user can SEE the caption is gone
+ * rather than trusting a progress bar. Also computes a coarse in-box pixel
+ * difference so "did anything actually change here?" is answered numerically.
+ */
+const BeforeAfterProof = ({ originalSrc, cleanedUrl, sampleSec, box }) => {
+  const beforeRef = React.useRef(null);
+  const afterRef = React.useRef(null);
+  const [state, setState] = React.useState({ status: "idle", diff: null });
+
+  React.useEffect(() => {
+    if (!originalSrc || !cleanedUrl || beforeRef.current == null) return;
+    let cancelled = false;
+    setState({ status: "loading", diff: null });
+
+    const grab = (src, canvas) => new Promise((resolve, reject) => {
+      const v = document.createElement("video");
+      v.src = src; v.muted = true; v.preload = "auto"; v.crossOrigin = "anonymous";
+      const onErr = () => reject(new Error("frame load failed"));
+      v.addEventListener("error", onErr, { once: true });
+      v.addEventListener("loadeddata", () => {
+        const seekDone = () => {
+          // setTimeout, not rAF — rAF is throttled/never-fires in bg tabs.
+          setTimeout(() => {
+            const w = canvas.width, h = canvas.height;
+            canvas.getContext("2d").drawImage(v, 0, 0, w, h);
+            const data = canvas.getContext("2d").getImageData(0, 0, w, h);
+            resolve(data);
+          }, 140);
+        };
+        v.addEventListener("seeked", seekDone, { once: true });
+        v.currentTime = Math.min(sampleSec, (v.duration || sampleSec));
+        setTimeout(seekDone, 2000); // safety
+      }, { once: true });
+    });
+
+    (async () => {
+      try {
+        const [a, b] = await Promise.all([
+          grab(originalSrc, beforeRef.current),
+          grab(cleanedUrl, afterRef.current),
+        ]);
+        if (cancelled) return;
+        // Coarse mean abs-diff INSIDE the region box (where the caption was).
+        const W = beforeRef.current.width, H = beforeRef.current.height;
+        const x0 = Math.max(0, Math.floor((box.x / 100) * W));
+        const y0 = Math.max(0, Math.floor((box.y / 100) * H));
+        const x1 = Math.min(W, Math.ceil(((box.x + box.w) / 100) * W));
+        const y1 = Math.min(H, Math.ceil(((box.y + box.h) / 100) * H));
+        let sum = 0, n = 0;
+        for (let y = y0; y < y1; y++) {
+          for (let x = x0; x < x1; x++) {
+            const i = (y * W + x) * 4;
+            sum += Math.abs(a.data[i] - b.data[i]);
+            n++;
+          }
+        }
+        setState({ status: "done", diff: n ? sum / n : 0 });
+      } catch (e) {
+        if (!cancelled) setState({ status: "error", diff: null });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [originalSrc, cleanedUrl, sampleSec, box.x, box.y, box.w, box.h]);
+
+  const boxStyle = {
+    position: "absolute",
+    left: `${box.x}%`, top: `${box.y}%`, width: `${box.w}%`, height: `${box.h}%`,
+    border: "1.5px solid var(--accent)", borderRadius: 2, pointerEvents: "none",
+  };
+  const frame = (label, ref) => (
+    <div style={{ flex: 1, minWidth: 0 }}>
+      <div style={{ fontSize: 9, letterSpacing: ".08em", color: "var(--ink-3)", marginBottom: 3 }}>{label}</div>
+      <div style={{ position: "relative", borderRadius: 4, overflow: "hidden", background: "var(--bg-2)" }}>
+        <canvas ref={ref} width={200} height={112} style={{ width: "100%", display: "block" }} />
+        <div style={boxStyle} />
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: ".08em", color: "var(--ink-3)", marginBottom: 6 }}>
+        Removal proof · {fmtTC(Math.round(sampleSec * 24), 24)}
+      </div>
+      <div style={{ display: "flex", gap: 8 }} role="group" aria-label="Before and after removal comparison">
+        {frame("BEFORE", beforeRef)}
+        {frame("AFTER", afterRef)}
+      </div>
+      <div style={{ marginTop: 6, fontSize: 11, lineHeight: 1.4 }} role="status" aria-live="polite">
+        {state.status === "loading" && <span style={{ color: "var(--ink-3)" }}>Comparing frames…</span>}
+        {state.status === "error" && <span style={{ color: "var(--pink)" }}>Couldn't compare frames.</span>}
+        {state.status === "done" && (
+          state.diff >= 6
+            ? <span style={{ color: "var(--accent)" }}>✓ Region changed (Δ {state.diff.toFixed(0)}) — caption removed.</span>
+            : <span style={{ color: "var(--warn)" }}>⚠ Little change here (Δ {state.diff.toFixed(0)}) — check the time window covers the caption.</span>
+        )}
+      </div>
+    </div>
+  );
+};
+
 /* ─── Right inspector — varies by mode ────────────────── */
 
-const Inspector = ({ region, mode, onChange, onDelete, onCommitTrack, fps, duration, selectedTakeId, onSelectTake, onRefit }) => {
+const Inspector = ({ region, mode, onChange, onDelete, onCommitTrack, fps, duration, selectedTakeId, onSelectTake, onRefit, onServerInpaint, serverInpaintStatus, serverInpaintError, cleanedResult, originalSrc }) => {
   if (!region && mode !== "track") {
     return (
       <div className="empty-state" style={{ padding: "44px 24px" }}>
@@ -1287,6 +1525,57 @@ const Inspector = ({ region, mode, onChange, onDelete, onCommitTrack, fps, durat
               <Icons.Sparkle size={11} /> Re-fit to active range
             </button>
           )}
+          {/* Opt-in high-quality removal on the local backend (ProPainter on
+              your own GPU). Browser stays the control plane: it uploads only
+              this region's mask + time window, streams progress, and swaps in
+              the cleaned clip. Requires the server/ backend to be running. */}
+          {onServerInpaint && (
+            <button
+              className="btn ghost"
+              style={{ width: "100%", justifyContent: "center", marginTop: 8, fontSize: 11 }}
+              onClick={() => onServerInpaint(r.id)}
+              disabled={!!serverInpaintStatus}
+              title="Send this region's mask + time window to the local GPU backend for high-quality inpainting"
+            >
+              <Icons.Sparkle size={11} />
+              {serverInpaintStatus
+                ? `${serverInpaintStatus.message || "Working…"}${serverInpaintStatus.pct != null ? ` (${serverInpaintStatus.pct}%)` : ""}`
+                : "Clean on server (HQ)"}
+            </button>
+          )}
+          {/* Live progress bar while the removal job runs. */}
+          {serverInpaintStatus && serverInpaintStatus.pct != null && (
+            <div style={{ marginTop: 6 }} role="status" aria-live="polite" aria-label={`Removal ${serverInpaintStatus.pct}%`}>
+              <div style={{ height: 5, borderRadius: 3, background: "var(--bg-2)", overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${serverInpaintStatus.pct}%`, background: "var(--accent)", transition: "width .2s" }} />
+              </div>
+            </div>
+          )}
+          {serverInpaintError && (
+            <div style={{ marginTop: 6, fontSize: 11, color: "var(--pink)", lineHeight: 1.4 }}>
+              {serverInpaintError}
+            </div>
+          )}
+          {cleanedResult && cleanedResult.regionId === r.id && (
+            <>
+              {originalSrc && (
+                <BeforeAfterProof
+                  originalSrc={originalSrc}
+                  cleanedUrl={cleanedResult.url}
+                  sampleSec={((r.startFrame ?? 0) + (r.endFrame ?? duration * fps)) / 2 / fps}
+                  box={{ x: r.x, y: r.y, w: r.w, h: r.h }}
+                />
+              )}
+              <a
+                href={cleanedResult.url}
+                download={`delogo-${r.id}.mp4`}
+                className="btn ghost"
+                style={{ width: "100%", justifyContent: "center", marginTop: 6, fontSize: 11, textDecoration: "none" }}
+              >
+                <Icons.Download size={11} /> Download cleaned clip
+              </a>
+            </>
+          )}
           <div style={{
             marginTop: 8,
             padding: "6px 9px",
@@ -1404,7 +1693,7 @@ const TakeCard = ({ id, active, onClick, badge, name, confidence, desc, path }) 
 /* ─── Timeline ────────────────────────────────────────── */
 
 const Timeline = ({ duration, fps, playhead, setPlayhead, regions, playing, setPlaying, onChangeRegion,
-                    selectedId, onSelectRegion,
+                    onNudgeRegion, selectedId, onSelectRegion,
                     notes, selectedNoteId, onSelectNote, onEditNote, onChangeNote, onDeleteNote, onAddNote,
                     firingNote, firingProgress }) => {
   const tlRef = useRef(null);
@@ -1441,11 +1730,58 @@ const Timeline = ({ duration, fps, playhead, setPlayhead, regions, playing, setP
     setPlayhead({ t: x, frame: Math.floor(x * totalFrames) });
   };
   const onPointerDown = (e) => {
+    // Focus the strip so arrow-key navigation works right after a click.
+    e.currentTarget.focus();
     onScrub(e);
     const move = (ev) => onScrub(ev);
     const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
+  };
+
+  // Keyboard navigation, in MM:SS:FF terms:
+  //   Up / Down          → ±00:00:01 (one frame)
+  //   Left / Right       → ±00:01:00 (one second)
+  //   Shift + arrows     → nudge the SELECTED region's IN point
+  //   Alt + arrows       → nudge the SELECTED region's OUT point
+  //   Home / End         → clip start / end
+  // Region trimming from the keyboard is the mobility-accessible equivalent
+  // of dragging the clip handles; every change is announced via the polite
+  // live region below (WCAG 4.1.3).
+  const [announce, setAnnounce] = useState("");
+  const stepBy = (deltaFrames) => {
+    const nf = clamp(Math.round(playhead.frame + deltaFrames), 0, totalFrames);
+    setPlayhead({ t: totalFrames > 0 ? nf / totalFrames : 0, frame: nf });
+  };
+  const nudgeRegion = (which, deltaFrames) => {
+    const r = (regions || []).find((x) => x.id === selectedId);
+    if (!r || !onNudgeRegion) return false;
+    // The relative delta is applied against CURRENT state inside the editor
+    // (functional update); the announced value is the same math on the
+    // freshest props this render has.
+    onNudgeRegion(r.id, which, deltaFrames, totalFrames);
+    if (which === "in") {
+      const nf = clamp(Math.round((r.startFrame ?? 0) + deltaFrames), 0, (r.endFrame ?? totalFrames) - 1);
+      setAnnounce(`${r.name || "Region"} in point ${fmtTC(nf, fps)}`);
+    } else {
+      const nf = clamp(Math.round((r.endFrame ?? totalFrames) + deltaFrames), (r.startFrame ?? 0) + 1, totalFrames);
+      setAnnounce(`${r.name || "Region"} out point ${fmtTC(nf, fps)}`);
+    }
+    return true;
+  };
+  const onKeyDown = (e) => {
+    const steps = {
+      ArrowUp: 1, ArrowDown: -1,        // one frame
+      ArrowRight: fps, ArrowLeft: -fps, // one second
+    };
+    if (e.key in steps) {
+      e.preventDefault();
+      if (e.shiftKey && nudgeRegion("in", steps[e.key])) return;
+      if (e.altKey && nudgeRegion("out", steps[e.key])) return;
+      stepBy(steps[e.key]);
+    }
+    else if (e.key === "Home") { e.preventDefault(); stepBy(-playhead.frame); }
+    else if (e.key === "End") { e.preventDefault(); stepBy(totalFrames - playhead.frame); }
   };
 
   // generate ruler ticks every ~30s
@@ -1470,6 +1806,8 @@ const Timeline = ({ duration, fps, playhead, setPlayhead, regions, playing, setP
           <span className="div">/</span>
           <span>{fmtTC(totalFrames, fps)}</span>
         </div>
+        {/* Screen-reader feedback for keyboard region trims (WCAG 4.1.3). */}
+        <span className="sr-only" role="status" aria-live="polite">{announce}</span>
         <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
           <button
             className="btn"
@@ -1487,7 +1825,21 @@ const Timeline = ({ duration, fps, playhead, setPlayhead, regions, playing, setP
         </div>
       </div>
       <div className="tl-body">
-        <div className="tl-inner" ref={tlRef} onPointerDown={onPointerDown} style={{ cursor: "ew-resize" }}>
+        <div
+          className="tl-inner"
+          ref={tlRef}
+          onPointerDown={onPointerDown}
+          onKeyDown={onKeyDown}
+          tabIndex={0}
+          role="slider"
+          aria-label="Timeline playhead"
+          aria-valuemin={0}
+          aria-valuemax={Math.round(totalFrames)}
+          aria-valuenow={Math.round(playhead.frame)}
+          aria-valuetext={fmtTC(playhead.frame, fps)}
+          title="Click to scrub · ↑/↓ one frame · ←/→ one second · Shift+arrows region IN · Alt+arrows region OUT · Home/End clip start/end"
+          style={{ cursor: "ew-resize" }}
+        >
           <div className="tl-ruler">
             {ticks.map((tk, i) => (
               <div key={i} className={`tl-tick ${tk.major ? "major" : ""}`} style={{ left: (tk.t * 100) + "%" }}>
@@ -1662,12 +2014,29 @@ const StreamStatus = ({ project }) => {
  * video — no more automatic full-clip scan that surprises users with
  * regions they didn't ask for. Selections persist within the session so
  * Re-detect doesn't keep re-asking. */
-const PreDetectModal = ({ open, defaults, onConfirm, onCancel }) => {
+const PreDetectModal = ({ open, defaults, onConfirm, onCancel, duration, fps, getPlayheadSec }) => {
   const [categories, setCategories] = useState(defaults);
-  React.useEffect(() => { if (open) setCategories(defaults); }, [open, defaults]);
+  // Optional time-range scope: when on, the scan only looks at this window of
+  // the timeline, so the detector doesn't flag captions across the whole clip.
+  const [rangeOn, setRangeOn] = useState(false);
+  const [startSec, setStartSec] = useState(0);
+  const [endSec, setEndSec] = useState(duration || 0);
+  React.useEffect(() => {
+    if (open) {
+      setCategories(defaults);
+      setRangeOn(false);
+      setStartSec(0);
+      setEndSec(duration || 0);
+    }
+  }, [open, defaults, duration]);
   if (!open) return null;
   const anyChecked = categories.captions || categories.logos || categories.watermarks || categories.audioOpps;
   const toggle = (k) => setCategories((c) => ({ ...c, [k]: !c[k] }));
+  const clamp = (s) => Math.max(0, Math.min(duration || 0, s));
+  const confirm = () => onConfirm(
+    categories,
+    rangeOn && endSec > startSec ? { startSeconds: startSec, endSeconds: endSec } : null,
+  );
   return (
     <div
       role="dialog" aria-modal="true" aria-label="What to detect"
@@ -1724,13 +2093,75 @@ const PreDetectModal = ({ open, defaults, onConfirm, onCancel }) => {
           </label>
         ))}
 
+        {/* Time-range scope — limit the scan to one stretch of the timeline. */}
+        <label
+          style={{
+            display: "flex", gap: 10, alignItems: "flex-start",
+            padding: "10px 12px", marginTop: 10, marginBottom: rangeOn ? 0 : 6,
+            border: `1px solid ${rangeOn ? "var(--accent)" : "var(--line)"}`,
+            borderRadius: 8, cursor: "pointer",
+            background: rangeOn ? "rgba(122,168,255,.06)" : "transparent",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={rangeOn}
+            onChange={() => setRangeOn((v) => !v)}
+            style={{ accentColor: "var(--accent)", marginTop: 3 }}
+          />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 13, fontWeight: 500, color: "var(--ink)" }}>Limit to a time range</div>
+            <div style={{ fontSize: 11, color: "var(--ink-3)", lineHeight: 1.5, marginTop: 2 }}>
+              Only scan this part of the timeline — keeps the detector from flagging captions across the whole clip.
+            </div>
+          </div>
+        </label>
+        {rangeOn && (
+          <div
+            style={{
+              display: "flex", gap: 12, alignItems: "flex-end",
+              padding: "12px", marginBottom: 6,
+              border: "1px solid var(--accent)", borderTop: "none",
+              borderRadius: "0 0 8px 8px", background: "rgba(122,168,255,.06)",
+            }}
+          >
+            {[
+              { lbl: "FROM", value: startSec, set: setStartSec, minSec: 0, maxSec: Math.max(0, endSec - 1 / fps) },
+              { lbl: "TO", value: endSec, set: setEndSec, minSec: startSec + 1 / fps, maxSec: duration || 0 },
+            ].map((f) => (
+              <div key={f.lbl} style={{ flex: 1 }}>
+                <div style={{ fontSize: 10, color: "var(--ink-3)", letterSpacing: ".06em", marginBottom: 4 }}>{f.lbl}</div>
+                <div style={{ display: "flex", gap: 4 }}>
+                  <TimecodeInput
+                    className="num-input"
+                    valueFrames={Math.round(f.value * fps)}
+                    fps={fps}
+                    minSec={f.minSec}
+                    maxSec={f.maxSec}
+                    onCommit={(sec) => f.set(sec)}
+                  />
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    style={{ fontSize: 10, padding: "0 8px" }}
+                    title="Set to the current playhead position"
+                    onClick={() => f.set(clamp(getPlayheadSec ? getPlayheadSec() : 0))}
+                  >
+                    Playhead
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
         <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
           <button className="btn ghost" style={{ flex: 1, justifyContent: "center" }} onClick={onCancel}>Skip</button>
           <button
             className="btn primary"
             style={{ flex: 1.2, justifyContent: "center" }}
             disabled={!anyChecked}
-            onClick={() => onConfirm(categories)}
+            onClick={confirm}
             title={anyChecked ? "Run the selected detectors" : "Tick at least one category"}
           >
             Start scan
@@ -1741,13 +2172,24 @@ const PreDetectModal = ({ open, defaults, onConfirm, onCancel }) => {
   );
 };
 
-const Editor = ({ project, onBack, onExport, tweaks }) => {
+const Editor = ({ project, onBack, onExport, onRegionsChange, tweaks }) => {
   // Real uploaded videos start with NO regions. DEFAULT_REGIONS are demo
   // overlays positioned for the bundled sample clip — they'd be wrong on any
   // other video. They only seed the mock showcase projects (which have no
   // videoSrc). On a real video, regions come solely from the user's
   // category-scoped scan or manual drawing.
-  const [regions, setRegions] = useState(() => (project?.videoSrc ? [] : DEFAULT_REGIONS));
+  // Reopened projects carry a `restore` payload (saved edits from a prior
+  // session); fresh real videos start empty; the no-video mock keeps demos.
+  const [regions, setRegions] = useState(() =>
+    project?.restore?.regions?.length
+      ? project.restore.regions
+      : project?.videoSrc ? [] : DEFAULT_REGIONS
+  );
+
+  // Keep the app-level copy in sync so the Export screen burns THESE regions.
+  // Without this, Export rendered app-state defaults (the demo regions) and
+  // a real video's edits silently never reached the encoder.
+  useEffect(() => { onRegionsChange?.(regions); }, [regions, onRegionsChange]);
   const [selectedId, setSelectedId] = useState(() => (project?.videoSrc ? null : "r1"));
   const [mode, setMode] = useState("detect"); // detect | draw | track | compare
   const [playhead, setPlayhead] = useState({ t: 0.36, frame: Math.floor(0.36 * 7200) });
@@ -1806,7 +2248,9 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
   // caption bands and logo corners. Errors surface in detectError.
   const [detectStatus, setDetectStatus] = useState(null); // { message, pct } | null
   const [detectError, setDetectError] = useState(null);
-  const [autoDetectDone, setAutoDetectDone] = useState(false);
+  // A restored project shouldn't re-open the "what to detect" modal — the
+  // user already made those choices in the session being restored.
+  const [autoDetectDone, setAutoDetectDone] = useState(() => !!project?.restore);
   // When a real video first loads we don't auto-scan: the user picks which
   // categories (captions / logos / audio description opportunities) they
   // want detected via the pre-detect modal.
@@ -1831,7 +2275,7 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
   // global Re-detect control, and the per-region Re-fit affordance.
   // `scope` is either "global" (replace all regions) or { regionId } to
   // surgically refit a single region's geometry + time bounds.
-  const runDetection = useCallback(async ({ categories, startSeconds, endSeconds, scope = "global" }) => {
+  const runDetection = useCallback(async ({ categories, startSeconds, endSeconds, spatialBBox, scope = "global" }) => {
     const v = videoRef.current;
     if (!v || !v.duration || !isFinite(v.duration)) return;
     if (typeof detectRegions !== "function") {
@@ -1844,15 +2288,24 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
     try {
       // Image-based detection (captions + logos + watermarks gated by categories).
       const wantImage = categories.captions || categories.logos || categories.watermarks;
+      // Sample density scales with the scan window. Short captions (2–3s)
+      // need a sample at least every ~2s or the coarse pass misses them
+      // entirely; a fixed count of 10–14 over a minute-plus window was
+      // sampling every 5–30s.
+      const scanDur = (endSeconds ?? v.duration) - (startSeconds ?? 0);
+      const sampleCount = (startSeconds !== undefined || endSeconds !== undefined)
+        ? Math.min(60, Math.max(10, Math.ceil(scanDur / 2)))
+        : Math.min(48, Math.max(14, Math.ceil(scanDur / 8)));
+
       const found = wantImage
         ? await detectRegions(v, {
-            sampleCount: scope === "global" ? 14 : 10,
+            sampleCount,
             categories: {
               captions: !!categories.captions,
               logos: !!categories.logos,
               watermarks: !!categories.watermarks,
             },
-            startSeconds, endSeconds,
+            startSeconds, endSeconds, spatialBBox,
             onProgress: (p) => setDetectStatus({
               message: p.message,
               pct: p.stage === "sampling" ? Math.round((p.index / p.total) * 100) : 100,
@@ -1883,18 +2336,20 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
         const newNotes = audioOpps.map(opportunityToNote);
         // A global scan replaces the auto-detected set: drop every
         // non-user-edited region — including the demo/seed regions for
-        // categories the user did NOT pick — and swap in only what this scan
-        // found. This MUST run even when newRegions is empty; otherwise seed
-        // logo/watermark regions linger and still get removed on export even
-        // though the user only selected captions. User-edited regions are
-        // preserved so manual work (IN/OUT, geometry, polygons) is never lost.
+        // categories the user did NOT pick — then merge in what this scan
+        // found via overlap-based dedup. Re-running detection on the same
+        // clip now REFRESHES existing regions instead of stacking near-
+        // duplicates beside them. User-edited regions are preserved AND
+        // new detections that overlap them are skipped (user wins).
         setRegions((prev) => {
           const keepers = prev.filter((r) => r.userEdited);
-          return [...keepers, ...newRegions];
+          return mergeRegionList(keepers, newRegions);
         });
         if (newRegions.length > 0) setSelectedId(newRegions[0].id);
         if (newNotes.length > 0) {
-          setNotes((prev) => [...prev, ...newNotes]);
+          // Dedup so a re-scan refreshes existing draft notes instead
+          // of stacking new ones beside them. Confirmed notes survive.
+          setNotes((prev) => mergeNoteList(prev, newNotes));
         }
         const totalFound = newRegions.length + newNotes.length;
         setDetectStatus({
@@ -1959,6 +2414,14 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
     await runDetection({
       categories: { captions: true, logos: false, audioOpps: false },
       startSeconds: t0, endSeconds: t1,
+      // Search near the region's current box (slightly padded) instead of the
+      // whole caption zone, so a refit can't jump onto nearby lecture text.
+      spatialBBox: {
+        xPct: Math.max(0, r.x - 4),
+        yPct: Math.max(0, r.y - 3),
+        wPct: Math.min(100 - Math.max(0, r.x - 4), r.w + 8),
+        hPct: Math.min(100 - Math.max(0, r.y - 3), r.h + 6),
+      },
       scope: { regionId },
     });
   }, [regions, fps, runDetection]);
@@ -2003,7 +2466,11 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
   // Like regions, DEFAULT_NOTES are demo descriptions tied to the sample clip.
   // Real uploaded videos start with an empty accessibility track; notes come
   // from Transcribe, the on-screen-text scan, or manual authoring.
-  const [notes, setNotes] = useState(() => (project?.videoSrc ? [] : DEFAULT_NOTES));
+  const [notes, setNotes] = useState(() =>
+    project?.restore?.notes?.length
+      ? project.restore.notes
+      : project?.videoSrc ? [] : DEFAULT_NOTES
+  );
   const [selectedNoteId, setSelectedNoteId] = useState(null);
   const [showRecorder, setShowRecorder] = useState(false);
   const [editingNote, setEditingNote] = useState(null);
@@ -2014,10 +2481,42 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
    * These are NEW captions we generate or hand-author to REPLACE the
    * burned-in open captions we're removing. They render as a real
    * overlay on the video and can be exported as a WebVTT track. */
-  const [captions, setCaptions] = useState([]);
+  const [captions, setCaptions] = useState(() => project?.restore?.captions || []);
+
+  // Auto-save real-video edit sessions so the Projects screen lists the
+  // user's OWN videos (the demo cards are gone). Debounced; keyed by file
+  // name + size so re-opening the same file continues the same entry. The
+  // video bytes themselves can't persist — the Projects screen re-attaches
+  // the file on open and restores this payload.
+  useEffect(() => {
+    if (!hasRealVideo || !project?.name) return;
+    if (regions.length === 0 && notes.length === 0 && captions.length === 0) return;
+    const id = `${project.name}::${project.fileSize || 0}`;
+    const timer = setTimeout(() => {
+      try {
+        const key = "unlogo:recent";
+        const list = JSON.parse(localStorage.getItem(key) || "[]");
+        const entry = {
+          id,
+          name: project.name,
+          fileSize: project.fileSize || 0,
+          durationSec: videoRef.current?.duration || duration || 0,
+          updatedAt: Date.now(),
+          regions, notes, captions,
+        };
+        const next = [entry, ...list.filter((e) => e.id !== id)].slice(0, 24);
+        localStorage.setItem(key, JSON.stringify(next));
+      } catch (_) { /* quota/JSON issues must never break editing */ }
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [hasRealVideo, project?.name, project?.fileSize, regions, notes, captions, duration]);
   const [selectedCueId, setSelectedCueId] = useState(null);
   const [autoCaption, setAutoCaption] = useState(null); // { stage, message, pct } | null
   const [autoCaptionError, setAutoCaptionError] = useState(null);
+  // Server (local GPU) inpainting: per-job progress + the cleaned result clip.
+  const [serverInpaint, setServerInpaint] = useState(null); // { stage, message, pct } | null
+  const [serverInpaintError, setServerInpaintError] = useState(null);
+  const [cleanedResult, setCleanedResult] = useState(null); // { url, regionId } | null
 
   const onAddCaption = useCallback((startOverride) => {
     const start = startOverride ?? (videoRef.current?.currentTime ?? 0);
@@ -2165,7 +2664,10 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
           ocrConfidence: s.confidence,
           ocrCoverage: s.coverageRatio,
         }));
-        setNotes((prev) => [...prev, ...draftNotes].sort((a, b) => a.frame - b.frame));
+        // Use overlap-aware merge so re-scanning on-screen text refreshes
+        // existing OCR-drafted descriptions instead of appending duplicates
+        // for the same gap. Confirmed (user-edited) notes are preserved.
+        setNotes((prev) => mergeNoteList(prev, draftNotes));
         setAutoCaption({
           stage: "done",
           message: `${draftNotes.length} draft description${draftNotes.length === 1 ? "" : "s"} from on-screen text`,
@@ -2184,6 +2686,349 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
       setAutoCaption(null);
     }
   }, [project?.videoSrc, captions, fps]);
+
+  // Build a JobSpec (server/README.md contract) from one editor region. Editor
+  // geometry is already percent-of-frame; keyframes store t as a 0..1 fraction
+  // of the clip with x/y only, so we convert t→seconds and carry w/h through.
+  const buildInpaintSpec = useCallback((region) => {
+    const v = videoRef.current;
+    const width = v?.videoWidth || 1280;
+    const height = v?.videoHeight || 720;
+    const dur = v?.duration || duration;
+    const startSec = (region.startFrame ?? 0) / fps;
+    const endSec = (region.endFrame ?? dur * fps) / fps;
+    const specRegion = {
+      id: region.id,
+      type: region.type,
+      x: region.x, y: region.y, w: region.w, h: region.h,
+      feather: region.feather,
+      // Per-region active window. The server erases the region ONLY inside
+      // this window (ffmpeg enable=between) and returns the full-length
+      // video — it no longer trims the clip to the window.
+      startSec, endSec,
+    };
+    if (Array.isArray(region.keyframes) && region.keyframes.length > 0) {
+      specRegion.keyframes = region.keyframes.map((k) => ({
+        t: (k.t ?? 0) * dur,
+        x: k.x ?? region.x,
+        y: k.y ?? region.y,
+        w: k.w ?? region.w,
+        h: k.h ?? region.h,
+      }));
+    }
+    const spec = {
+      fps,
+      width,
+      height,
+      timeRange: { startSec, endSec },
+      regions: [specRegion],
+    };
+    // Any authored/extracted cues become a soft subtitle track in the
+    // cleaned file — open captions off the pixels, closed captions on.
+    if (captions.length > 0 && typeof window.cuesToSrt === "function") {
+      spec.subtitlesSrt = window.cuesToSrt(captions);
+    }
+    return spec;
+  }, [fps, duration, captions]);
+
+  const runServerInpaint = useCallback(async (regionId) => {
+    setServerInpaintError(null);
+    const region = regions.find((r) => r.id === regionId);
+    if (!region) return;
+    if (!project?.videoSrc) {
+      setServerInpaintError("Load a video before cleaning on the server.");
+      return;
+    }
+    setServerInpaint({ stage: "init", message: "Loading server client…", pct: 0 });
+    try {
+      if (typeof window.runServerInpaint !== "function") {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = "inpaint.js";
+          s.onload = resolve;
+          s.onerror = () => reject(new Error("Could not load inpaint.js"));
+          document.body.appendChild(s);
+        });
+      }
+      if (typeof window.runServerInpaint !== "function") {
+        throw new Error("Inpaint client not available after load");
+      }
+      const spec = buildInpaintSpec(region);
+      const { url } = await window.runServerInpaint(project.videoSrc, spec, {
+        onProgress: (p) => setServerInpaint({
+          stage: p.stage,
+          message: p.message,
+          pct: p.pct ?? 0,
+        }),
+      });
+      setCleanedResult({ url, regionId });
+      setServerInpaint({ stage: "done", message: "Cleaned clip ready", pct: 100 });
+      setTimeout(() => setServerInpaint(null), 5000);
+    } catch (err) {
+      setServerInpaintError(`Server cleanup failed: ${err.message}`);
+      setServerInpaint(null);
+    }
+  }, [regions, project?.videoSrc, buildInpaintSpec]);
+
+  /* ─── AI chat bridge (window.UnlogoAPI) ───────────────
+   * bridge.js forwards MCP tool calls here (see server/mcp_server.py).
+   * Reassigned after every render so handlers always close over fresh
+   * state; removed on unmount so the bridge reports "editor not open"
+   * instead of acting on a dead screen. All timecode parsing happens here
+   * (parseTC) so chat and UI share one timecode dialect. */
+  const ensureInpaintClient = useCallback(async () => {
+    if (typeof window.runServerInpaint === "function") return;
+    await new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "inpaint.js";
+      s.onload = resolve;
+      s.onerror = () => reject(new Error("Could not load inpaint.js"));
+      document.body.appendChild(s);
+    });
+  }, []);
+
+  // Read-your-writes shadow for the bridge: React state commits async, so a
+  // chat client calling get_project_state right after add_region would see
+  // stale data if handlers read only render-time closures. Mutating handlers
+  // update this ref synchronously; the effect re-syncs it every render.
+  const bridgeLatest = useRef({ regions: [], notes: [], captions: [] });
+  useEffect(() => {
+    bridgeLatest.current = { regions, notes, captions };
+    const totalF = Math.round((duration || 0) * fps);
+    const tcToSec = (tc) => {
+      const sec = parseTC(String(tc), fps);
+      if (sec == null) throw new Error(`Unparseable timecode: "${tc}" — use MM:SS:FF, MM:SS, or plain seconds`);
+      return Math.max(0, Math.min(duration || sec, sec));
+    };
+    const regionSummary = (r) => ({
+      id: r.id, name: r.name, type: r.type, method: r.method,
+      visible: r.visible !== false,
+      x: r.x, y: r.y, w: r.w, h: r.h,
+      startFrame: r.startFrame ?? 0,
+      endFrame: r.endFrame ?? totalF,
+      startTc: fmtTC(r.startFrame ?? 0, fps),
+      endTc: fmtTC(r.endFrame ?? totalF, fps),
+      startSec: +(((r.startFrame ?? 0) / fps).toFixed(3)),
+      endSec: +(((r.endFrame ?? totalF) / fps).toFixed(3)),
+    });
+
+    window.UnlogoAPI = {
+      getState: () => ({
+        project: { name: project?.name || null, fileSize: project?.fileSize || 0 },
+        hasRealVideo,
+        fps,
+        durationSec: +(duration || 0).toFixed(3),
+        playheadSec: +(playhead.frame / fps).toFixed(3),
+        playheadTc: fmtTC(playhead.frame, fps),
+        regions: bridgeLatest.current.regions.map(regionSummary),
+        notes: bridgeLatest.current.notes.map((n) => ({
+          id: n.id, text: n.text, mode: n.mode,
+          startSec: +(n.frame / fps).toFixed(3),
+          durationSec: +(n.durationFrames / fps).toFixed(3),
+        })),
+        captions: bridgeLatest.current.captions.map((c) => ({
+          id: c.id, text: c.text, startSec: c.startSeconds, endSec: c.endSeconds, source: c.source,
+        })),
+      }),
+
+      seek: ({ tc }) => {
+        const sec = tcToSec(tc);
+        if (duration > 0) seekFromEditor(sec / duration);
+        return { playheadSec: sec, playheadTc: fmtTC(Math.round(sec * fps), fps) };
+      },
+
+      addRegion: ({ x, y, w, h, startTc, endTc, method = "inpaint", type = "caption", name }) => {
+        const startFrame = Math.round(tcToSec(startTc) * fps);
+        const endFrame = Math.round(tcToSec(endTc) * fps);
+        if (endFrame <= startFrame) throw new Error("end_tc must be after start_tc");
+        const id = "ai-" + Date.now();
+        const region = {
+          id, name: name || `AI region (${type})`, type,
+          cls: type === "caption" ? "r-caption" : type === "logo" ? "r-logo" : "r-watermark",
+          x, y, w, h, method, opacity: 100, feather: 12, motion: "static",
+          visible: true, startFrame, endFrame, confidence: 1, userEdited: true,
+        };
+        bridgeLatest.current = { ...bridgeLatest.current, regions: [...bridgeLatest.current.regions, region] };
+        setRegions((rs) => [...rs, region]);
+        setSelectedId(id);
+        return regionSummary(region);
+      },
+
+      updateRegion: ({ id, patch = {} }) => {
+        const existing = bridgeLatest.current.regions.find((r) => r.id === id);
+        if (!existing) throw new Error(`No region with id "${id}"`);
+        const next = { ...existing, userEdited: true };
+        for (const k of ["x", "y", "w", "h"]) if (patch[k] != null) next[k] = patch[k];
+        if (patch.method) next.method = patch.method;
+        if (patch.visible != null) next.visible = patch.visible;
+        if (patch.startTc != null) next.startFrame = Math.round(tcToSec(patch.startTc) * fps);
+        if (patch.endTc != null) next.endFrame = Math.round(tcToSec(patch.endTc) * fps);
+        if ((next.endFrame ?? totalF) <= (next.startFrame ?? 0)) throw new Error("Region time window would be empty");
+        bridgeLatest.current = { ...bridgeLatest.current, regions: bridgeLatest.current.regions.map((r) => (r.id === id ? next : r)) };
+        setRegions((rs) => rs.map((r) => (r.id === id ? next : r)));
+        return regionSummary(next);
+      },
+
+      deleteRegion: ({ id }) => {
+        if (!bridgeLatest.current.regions.some((r) => r.id === id)) throw new Error(`No region with id "${id}"`);
+        bridgeLatest.current = { ...bridgeLatest.current, regions: bridgeLatest.current.regions.filter((r) => r.id !== id) };
+        setRegions((rs) => rs.filter((r) => r.id !== id));
+        return { deleted: id };
+      },
+
+      detectCaptions: async ({ startTc, endTc }) => {
+        await runDetection({
+          categories: { captions: true, logos: false, watermarks: false, audioOpps: false },
+          startSeconds: tcToSec(startTc),
+          endSeconds: tcToSec(endTc),
+          scope: "global",
+        });
+        return { done: true };
+      },
+
+      getFrame: async ({ tc, maxWidth = 640 }) => {
+        const v = videoRef.current;
+        if (!v || !hasRealVideo) throw new Error("No video loaded in the editor");
+        const sec = tcToSec(tc);
+        if (duration > 0) seekFromEditor(sec / duration);
+        await new Promise((resolve) => {
+          const done = () => { v.removeEventListener("seeked", done); setTimeout(resolve, 120); };
+          v.addEventListener("seeked", done);
+          setTimeout(resolve, 1500); // safety — never hang the bridge
+        });
+        const scale = Math.min(1, maxWidth / (v.videoWidth || maxWidth));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(2, Math.round((v.videoWidth || 640) * scale));
+        canvas.height = Math.max(2, Math.round((v.videoHeight || 360) * scale));
+        canvas.getContext("2d").drawImage(v, 0, 0, canvas.width, canvas.height);
+        return { dataUrl: canvas.toDataURL("image/jpeg", 0.8), tc: fmtTC(Math.round(sec * fps), fps) };
+      },
+
+      addNote: ({ tc, text, mode = "overlay" }) => {
+        const sec = tcToSec(tc);
+        const note = {
+          id: "ai-note-" + Date.now(),
+          frame: Math.round(sec * fps),
+          // Rough reading-time duration; the user can drag it afterwards.
+          durationFrames: Math.max(24, Math.round(Math.max(1.5, String(text).length * 0.06) * fps)),
+          text: String(text),
+          mode: mode === "pause" ? "pause" : "overlay",
+        };
+        bridgeLatest.current = { ...bridgeLatest.current, notes: [...bridgeLatest.current.notes, note].sort((a, b) => a.frame - b.frame) };
+        setNotes((ns) => [...ns, note].sort((a, b) => a.frame - b.frame));
+        return { id: note.id, startSec: sec, durationSec: +(note.durationFrames / fps).toFixed(2) };
+      },
+
+      removeRegions: async ({ ids = [] }) => {
+        if (!hasRealVideo) throw new Error("No video loaded in the editor");
+        const targets = bridgeLatest.current.regions.filter((r) => (ids.length ? ids.includes(r.id) : r.visible !== false));
+        if (targets.length === 0) throw new Error("No matching regions to remove");
+        await ensureInpaintClient();
+        const v = videoRef.current;
+        const spec = {
+          fps,
+          width: v?.videoWidth || 1280,
+          height: v?.videoHeight || 720,
+          regions: targets.map((r) => ({
+            id: r.id, type: r.type, x: r.x, y: r.y, w: r.w, h: r.h, feather: r.feather,
+            startSec: (r.startFrame ?? 0) / fps,
+            endSec: (r.endFrame ?? totalF) / fps,
+          })),
+        };
+        // Ride the replacement CC track along with the removal: the erased
+        // open captions come back as toggleable soft subtitles.
+        const cueList = bridgeLatest.current.captions;
+        if (cueList.length > 0 && typeof window.cuesToSrt === "function") {
+          spec.subtitlesSrt = window.cuesToSrt(cueList);
+        }
+        const { url, blob } = await window.runServerInpaint(project.videoSrc, spec, {
+          onProgress: (p) => setServerInpaint({ stage: p.stage, message: p.message, pct: p.pct ?? 0 }),
+        });
+        setCleanedResult({ url, regionId: targets[0].id });
+        setServerInpaint({ stage: "done", message: "Cleaned clip ready", pct: 100 });
+        return {
+          regionCount: targets.length,
+          resultBytes: blob.size,
+          note: "Cleaned full-length video is ready in the editor UI for the user to download.",
+        };
+      },
+
+      extractCaptions: async ({ startTc, endTc } = {}) => {
+        if (!hasRealVideo) throw new Error("No video loaded in the editor");
+        if (typeof window.extractBurnedCaptions !== "function") {
+          throw new Error("caption-extract.js not loaded — reload the page");
+        }
+        const res = await window.extractBurnedCaptions(videoRef.current, {
+          startSec: startTc != null ? tcToSec(startTc) : 0,
+          endSec: endTc != null ? tcToSec(endTc) : duration,
+          videoDurationSec: duration,
+          fps,
+          onProgress: (p) => setAutoCaption({ stage: p.stage, message: p.message, pct: p.pct }),
+        });
+        const stamped = res.cues.map((c, i) => ({
+          id: `ocr-cue-${Date.now()}-${i}`,
+          startSeconds: c.startSeconds, endSeconds: c.endSeconds,
+          text: c.text, source: "ocr",
+        }));
+        bridgeLatest.current = {
+          ...bridgeLatest.current,
+          captions: [...bridgeLatest.current.captions, ...stamped].sort((a, b) => a.startSeconds - b.startSeconds),
+          regions: [...bridgeLatest.current.regions, ...res.regions],
+        };
+        setCaptions((cs) => [...cs, ...stamped].sort((a, b) => a.startSeconds - b.startSeconds));
+        setRegions((rs) => [...rs, ...res.regions]);
+        setAutoCaption({ stage: "done", message: `${stamped.length} captions extracted → ${res.regions.length} removal shapes`, pct: 100 });
+        setTimeout(() => setAutoCaption(null), 5000);
+        return {
+          cueCount: stamped.length,
+          regionCount: res.regions.length,
+          sampledFrames: res.sampledFrames,
+          cues: stamped.map((c) => ({ start: c.startSeconds, end: c.endSeconds, text: c.text })),
+        };
+      },
+
+      upscale: async ({ scale, targetHeight, sharpen }) => {
+        if (!hasRealVideo) throw new Error("No video loaded in the editor");
+        await ensureInpaintClient();
+        if (typeof window.runServerUpscale !== "function") {
+          throw new Error("Upscale client unavailable after loading inpaint.js");
+        }
+        const { url, blob } = await window.runServerUpscale(
+          project.videoSrc,
+          { scale, targetHeight, sharpen },
+          { onProgress: (p) => setServerInpaint({ stage: p.stage, message: p.message, pct: p.pct ?? 0 }) }
+        );
+        setCleanedResult({ url, regionId: "upscale" });
+        setServerInpaint({ stage: "done", message: "Upscaled video ready", pct: 100 });
+        return {
+          resultBytes: blob.size,
+          note: "Upscaled full-length video is ready in the editor UI for the user to download.",
+        };
+      },
+
+      muxDescriptions: async () => {
+        if (!hasRealVideo) throw new Error("No video loaded in the editor");
+        const list = bridgeLatest.current.notes.filter((n) => (n.text || "").trim());
+        if (list.length === 0) throw new Error("No audio notes with text — add some with add_audio_note first");
+        await ensureInpaintClient();
+        if (typeof window.runServerDescribe !== "function") {
+          throw new Error("Describe client unavailable after loading inpaint.js");
+        }
+        const { url, blob } = await window.runServerDescribe(
+          project.videoSrc,
+          list.map((n) => ({ startSec: n.frame / fps, text: n.text, mode: n.mode })),
+          {}
+        );
+        setCleanedResult({ url, regionId: "audio-descriptions" });
+        return {
+          noteCount: list.length,
+          resultBytes: blob.size,
+          note: "Described MKV (extra Audio Description track) is ready in the editor UI.",
+        };
+      },
+    };
+  });
+  useEffect(() => () => { delete window.UnlogoAPI; }, []);
   // firing = { id, mode, startedAt, durationMs, wasPlaying }; null when nothing playing.
   const [firing, setFiring] = useState(null);
   const [firingProgress, setFiringProgress] = useState(0);
@@ -2289,6 +3134,20 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
   const onSelectRegion = (id) => setSelectedId(id);
   const onChangeRegion = (next) => {
     setRegions((rs) => rs.map((r) => (r.id === next.id ? next : r)));
+  };
+  // Keyboard trim path: applies a RELATIVE frame delta against the CURRENT
+  // state (functional update), so rapid keystrokes can't clobber each other
+  // the way replace-with-spread would with stale props.
+  const onNudgeRegion = (id, which, deltaFrames, maxFrames) => {
+    setRegions((rs) => rs.map((r) => {
+      if (r.id !== id) return r;
+      if (which === "in") {
+        const nf = clamp(Math.round((r.startFrame ?? 0) + deltaFrames), 0, (r.endFrame ?? maxFrames) - 1);
+        return { ...r, startFrame: nf };
+      }
+      const nf = clamp(Math.round((r.endFrame ?? maxFrames) + deltaFrames), (r.startFrame ?? 0) + 1, maxFrames);
+      return { ...r, endFrame: nf };
+    }));
   };
   const onToggleVisible = (id) => {
     setRegions((rs) => rs.map((r) => (r.id === id ? { ...r, visible: !r.visible } : r)));
@@ -2406,6 +3265,22 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
           onDeleteCue={onDeleteCaption}
           onAddCue={onAddCaption}
           onAutoCaption={runAutoCaption}
+          onExtractCC={hasRealVideo ? () => {
+            window.UnlogoAPI?.extractCaptions({}).catch((e) => {
+              setAutoCaptionError(`Caption extraction failed: ${e.message}`);
+              setAutoCaption(null);
+            });
+          } : undefined}
+          onDownloadSrt={() => {
+            const srt = window.cuesToSrt ? window.cuesToSrt(captions) : "";
+            if (!srt) return;
+            const url = URL.createObjectURL(new Blob([srt], { type: "text/plain" }));
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = (project?.name || "captions").replace(/\.[^.]+$/, "") + ".srt";
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 3000);
+          }}
           onScanText={runOCRScan}
           autoCaptionStatus={autoCaption}
           autoCaptionError={autoCaptionError}
@@ -2578,6 +3453,11 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
             onChange={onChangeRegion}
             onDelete={onDeleteRegion}
             onRefit={refitRegion}
+            onServerInpaint={hasRealVideo ? runServerInpaint : undefined}
+            serverInpaintStatus={serverInpaint}
+            serverInpaintError={serverInpaintError}
+            cleanedResult={cleanedResult}
+            originalSrc={project?.videoSrc}
             fps={fps}
             duration={duration}
             selectedTakeId={selectedTake}
@@ -2602,6 +3482,7 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
           playing={playing}
           setPlaying={setPlaying}
           onChangeRegion={onChangeRegion}
+          onNudgeRegion={onNudgeRegion}
           selectedId={selectedId}
           onSelectRegion={onSelectRegion}
           notes={notes}
@@ -2631,15 +3512,23 @@ const Editor = ({ project, onBack, onExport, tweaks }) => {
       <PreDetectModal
         open={preDetectOpen}
         defaults={detectCategories}
+        duration={duration}
+        fps={fps}
+        getPlayheadSec={() => videoRef.current?.currentTime ?? (playhead.frame / fps)}
         onCancel={() => { setPreDetectOpen(false); setAutoDetectDone(true); }}
-        onConfirm={(cats) => {
+        onConfirm={(cats, range) => {
           setDetectCategories(cats);
           setPreDetectOpen(false);
           // Mark autoDetectDone immediately so the first-load useEffect
           // doesn't see an in-flight detection as "no decision made yet"
           // and re-open the modal mid-scan.
           setAutoDetectDone(true);
-          runDetection({ categories: cats, scope: "global" });
+          runDetection({
+            categories: cats,
+            scope: "global",
+            startSeconds: range?.startSeconds,
+            endSeconds: range?.endSeconds,
+          });
         }}
       />
     </div>

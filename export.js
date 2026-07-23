@@ -9,9 +9,11 @@
  *      Result cached on window.__ffmpegReady so subsequent exports skip loading.
  *   2. Fetch videoSrc as a Blob. Works for blob: URLs (uploads) and any
  *      same-origin or CORS-friendly HTTP(S) URL. Throws clearly on CORS failure.
- *   3. Build a filter_complex graph: split → crop → boxblur → overlay per region,
- *      each gated with enable='between(t,start,end)' so the blur only shows
- *      during the region's [startFrame, endFrame] window.
+ *   3. Build a filter_complex graph. Regions with an erase method (delogo /
+ *      inpaint) run ffmpeg's delogo filter — background interpolated over the
+ *      text. Blur-method and polygon regions get split → crop → boxblur →
+ *      overlay. Every filter is gated with enable='between(t,start,end)' so
+ *      it only applies during the region's [startFrame, endFrame] window.
  *   4. Run ffmpeg with libx264 + audio copy. Stream progress via onProgress.
  *   5. Read the output as Uint8Array → wrap in Blob → return.
  *
@@ -125,7 +127,8 @@
   }
 
   // Pre-compute per-region geometry so the rest of the pipeline doesn't
-  // recompute it three times. Returns an array of { r, isPoly, bbox, bboxPx, t0, t1, radius }.
+  // recompute it three times. Returns an array of
+  // { r, isPoly, erase, bbox, bboxPx, delogoPx, t0, t1, radius }.
   function planRegions(regions, vw, vh, fps, totalSeconds) {
     return regions
       .filter((r) => r.visible !== false && r.method !== "none")
@@ -139,7 +142,22 @@
         const radius = Math.max(5, Math.min(20, Math.round(Math.min(w, h) / 12)));
         const t0 = esc(Math.max(0, (r.startFrame ?? 0) / fps));
         const t1 = esc(Math.min(totalSeconds, (r.endFrame ?? Number.MAX_SAFE_INTEGER) / fps));
-        return { r, isPoly, bbox, bboxPx: { x, y, w, h }, radius, t0, t1 };
+        // Rect regions whose method asks for removal (not blurring) go
+        // through ffmpeg's delogo filter — background interpolated over the
+        // text. delogo needs its rect strictly INSIDE the frame (it reads
+        // the pixels surrounding the box), so clamp to x,y >= 1 and
+        // x+w <= vw-1 / y+h <= vh-1 or ffmpeg rejects the filter.
+        const dx = Math.min(Math.max(1, x), vw - 3);
+        const dy = Math.min(Math.max(1, y), vh - 3);
+        const dw = Math.max(1, Math.min(w, vw - dx - 1));
+        const dh = Math.max(1, Math.min(h, vh - dy - 1));
+        const erase = !isPoly && (r.method === "delogo" || r.method === "inpaint");
+        return {
+          r, isPoly, erase, bbox,
+          bboxPx: { x, y, w, h },
+          delogoPx: { x: dx, y: dy, w: dw, h: dh },
+          radius, t0, t1,
+        };
       });
   }
 
@@ -148,14 +166,33 @@
   // and present as ffmpeg inputs 1..N (input 0 is the video).
   function buildFilterGraph(plans) {
     if (plans.length === 0) return null;
+    const erasePlans = plans.filter((p) => p.erase);
+    const blurPlans = plans.filter((p) => !p.erase);
     const parts = [];
-    // Step 1: split the input video into base + one branch per region.
-    const branches = plans.map((_, i) => `[r${i}]`);
-    parts.push(`[0:v]split=${plans.length + 1}[bg]${branches.join("")}`);
 
-    // Step 2: each region produces a labeled fragment "f{i}".
+    // Step 0: erase-method regions (delogo / inpaint) run ffmpeg's delogo
+    // directly on the main stream, each gated to its time window. This
+    // ERASES the text — background interpolated over it — instead of the
+    // old behavior of blurring everything.
+    let base = "0:v";
+    if (erasePlans.length > 0) {
+      const chain = erasePlans
+        .map((p) => `delogo=x=${p.delogoPx.x}:y=${p.delogoPx.y}:w=${p.delogoPx.w}:h=${p.delogoPx.h}:enable='between(t\\,${p.t0}\\,${p.t1})'`)
+        .join(",");
+      const outLabel = blurPlans.length === 0 ? "v" : "base";
+      parts.push(`[${base}]${chain}[${outLabel}]`);
+      base = outLabel;
+    }
+    if (blurPlans.length === 0) return parts.join(";");
+
+    // Step 1: split the (possibly delogo'd) stream into base + one branch
+    // per blur region.
+    const branches = blurPlans.map((_, i) => `[r${i}]`);
+    parts.push(`[${base}]split=${blurPlans.length + 1}[bg]${branches.join("")}`);
+
+    // Step 2: each blur region produces a labeled fragment "f{i}".
     let polyMaskInputIdx = 1; // PNG mask inputs come right after the video.
-    plans.forEach((p, i) => {
+    blurPlans.forEach((p, i) => {
       const { isPoly, bboxPx, radius } = p;
       if (isPoly) {
         // Crop the polygon's bounding box, blur it, force RGBA, then alphamerge
@@ -173,8 +210,8 @@
     // Step 3: chain overlays. Each fragment overlays back at its bbox origin,
     // gated to its time window via enable='between(t,start,end)'.
     let last = "bg";
-    plans.forEach((p, i) => {
-      const next = i === plans.length - 1 ? "v" : `t${i}`;
+    blurPlans.forEach((p, i) => {
+      const next = i === blurPlans.length - 1 ? "v" : `t${i}`;
       parts.push(`[${last}][f${i}]overlay=${p.bboxPx.x}:${p.bboxPx.y}:enable='between(t\\,${p.t0}\\,${p.t1})'[${next}]`);
       last = next;
     });

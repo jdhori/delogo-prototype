@@ -906,6 +906,87 @@
     transition: border-color .12s;
   }
   .num-input:focus { outline: none; border-color: var(--accent); }
+  /* Keyboard focus on the timeline strip (arrow-key frame/second stepping) */
+  .tl-inner:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  /* Visually hidden, still announced by screen readers */
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  /* ── Theme CTA palette ─────────────────────────────────
+   * Night: activation buttons are PURPLE with white text (7000-series
+   * purple passes 4.5:1 with #fff). Day: activation buttons are ORANGE
+   * with black text (7.5:1). The theme toggle mirrors the active accent. */
+  [data-theme="night"] .btn.primary {
+    background: #6d4aff;
+    color: #fff;
+    border-color: #5b3ce0;
+  }
+  [data-theme="night"] .btn.primary:hover { background: #7f61ff; }
+  [data-theme="night"] .projects-head .btn {
+    background: #6d4aff;
+    color: #fff;
+    border-color: #5b3ce0;
+  }
+  [data-theme="night"] .projects-head .btn:hover { background: #7f61ff; }
+  [data-theme="day"] .btn.primary {
+    background: #f97316;
+    color: #000;
+    border-color: #ea580c;
+  }
+  [data-theme="day"] .btn.primary:hover { background: #fb8b3c; }
+  [data-theme="night"] .theme-toggle button.active {
+    background: #6d4aff;
+    color: #fff;
+  }
+  [data-theme="day"] .theme-toggle button.active {
+    background: #f97316;
+    color: #111;
+  }
+
+  /* ── Dwell activation ──────────────────────────────────
+   * Progress ring that fills while the pointer dwells on an activatable
+   * element; completing the ring clicks it. */
+  .dwell-ring {
+    position: fixed;
+    display: none;
+    width: 28px; height: 28px;
+    z-index: 9999;
+    pointer-events: none;
+    filter: drop-shadow(0 1px 3px rgba(0,0,0,.5));
+  }
+  .dwell-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+  .dwell-ring circle { fill: none; stroke-width: 4; }
+  .dwell-ring .bg { stroke: var(--line); }
+  .dwell-ring .fg { stroke: var(--accent); stroke-linecap: round; transition: stroke-dashoffset .08s linear; }
+  .dwell-ctl {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .dwell-ctl .secs {
+    min-width: 34px;
+    text-align: center;
+    font-family: 'Geist Mono', monospace;
+    font-size: 11px;
+    color: var(--ink-2);
+  }
+  /* Compact MM:SS:FF inputs in caption cue rows */
+  .num-input.tc-mini {
+    width: 76px;
+    font-size: 11px;
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
   .num-with-label {
     position: relative;
   }
@@ -1861,6 +1942,8 @@
         ["text/javascript", "image-slot.js"],
         ["text/javascript", "detect.js"],
         ["text/javascript", "export.js"],
+        ["text/javascript", "caption-extract.js"],
+        ["text/javascript", "bridge.js"],
         ["text/babel",      "tweaks-panel.jsx"],
         ["text/babel",      "icons.jsx"],
         ["text/babel",      "scenes.jsx"],
