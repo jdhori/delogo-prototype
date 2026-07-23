@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "kapture": {
+      "command": "npx",
+      "args": ["-y", "kapture-mcp@latest", "bridge"]
+    }
+  }
+}
